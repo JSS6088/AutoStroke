@@ -1,0 +1,23 @@
+schema_version = "1.0.0"
+
+id = "autostroke"
+version = "0.10.6"
+name = "AutoStroke"
+tagline = "Painterly flat-per-cell texture baking from any mesh"
+maintainer = "Jason <yunfeng2@andrew.cmu.edu>"
+type = "add-on"
+
+blender_version_min = "5.0.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+tags = ["Material", "Render"]
+
+[permissions]
+files = "Write baked texture maps to the chosen working directory"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/tests/",
+  ".DS_Store",
+]
