@@ -76,10 +76,24 @@ void main()
 }
 """
 
+STROKE_TILE_W = 4096
+"""Fixed width for the stroke texture, same reasoning and same value as list_tex/cell_tex
+below: MTLTextureDescriptor on Apple GPUs (and plenty of others) caps a 2D texture at
+16384 texels wide. stroke_tex used to be exactly (stroke count, 4) -- width equal to the
+RAW stroke count -- so any preview past 16384 strokes (well inside PREVIEW_BUDGET's
+60,000) hit that cap and crashed the whole process: a native Metal assertion failure, not
+a Python exception, so nothing in this addon could have caught or reported it. Tiling into
+a fixed-width grid, the same way list_tex already had to be, removes the ceiling instead
+of trying to guess a safe one. Hardcoded into the GLSL below (STROKE_TILE_W token,
+substituted after this string) rather than passed as a uniform -- the push-constant
+budget is already exactly 128 bytes with nothing spare, and a width we choose ourselves
+needs no uniform slot at all."""
+
 FRAG = """
 vec4 stroke_row(int i, int row)
 {
-    return texelFetch(u_stroke, ivec2(i, row), 0);
+    ivec2 tc = ivec2(i % STROKE_TILE_W, (i / STROKE_TILE_W) * 4 + row);
+    return texelFetch(u_stroke, tc, 0);
 }
 
 void main()
@@ -155,6 +169,8 @@ void main()
     fragColor = vec4(vec3(lit * tone), 1.0);
 }
 """
+
+FRAG = FRAG.replace("STROKE_TILE_W", str(STROKE_TILE_W))
 
 
 def make_shader():
@@ -326,6 +342,43 @@ def _flat_texture(values, width=4096):
     return tex, width
 
 
+def stroke_tile_buffer(packed, width=STROKE_TILE_W):
+    """Pure-numpy half of _pack_stroke_texture: the (4*tile_h, width, 4) array a
+    width-capped RGBA32F texture needs, with stroke i's row r placed at
+    (col=i % width, row=(i // width) * 4 + r) -- matching the shader's stroke_row().
+    Split out from the GPU upload so this indexing can be tested without bpy/gpu, the
+    same way pack_strokes/build_grid are.
+    """
+    n = max(len(packed), 1)
+    tile_h = int(np.ceil(n / float(width)))
+    out = np.zeros((4 * tile_h, width, 4), np.float32)
+    n_real = len(packed)
+    col = np.arange(n_real) % width
+    base_row = (np.arange(n_real) // width) * 4
+    for r in range(4):
+        out[base_row + r, col] = packed[:, r]
+    return out
+
+
+def _pack_stroke_texture(packed, width=STROKE_TILE_W):
+    """(n,4,4) stroke rows -> a width-capped RGBA32F texture, tiled 4 rows per stroke.
+
+    A texture width equal to the raw stroke count -- what this used to be -- exceeds
+    MTLTextureDescriptor's max width (16384) past 16384 strokes, well inside
+    PREVIEW_BUDGET's 60,000, and crashes the whole process with a native Metal
+    assertion: not a Python exception, so nothing here could have caught or reported
+    it. Tiling into a fixed-width grid instead, the same fix list_tex already needed
+    via _flat_texture, removes the ceiling instead of trying to guess a safe one.
+    """
+    import gpu
+    out = stroke_tile_buffer(packed, width)
+    h = out.shape[0]
+    tex = gpu.types.GPUTexture(
+        (width, h), format='RGBA32F',
+        data=gpu.types.Buffer('FLOAT', width * h * 4, out.ravel()))
+    return tex
+
+
 def _build(context, obj):
     """Everything the shader needs, from the same seeds the bake would use."""
     import gpu
@@ -359,11 +412,7 @@ def _build(context, obj):
     gmin, ginv, dim, starts, counts, lst = build_grid(pos, r, T, nrm, bbl)
 
     n = len(pos)
-    rows = packed.shape[1]
-    stroke_tex = gpu.types.GPUTexture(
-        (n, rows), format='RGBA32F',
-        data=gpu.types.Buffer('FLOAT', n * rows * 4,
-                              np.ascontiguousarray(packed.transpose(1, 0, 2)).ravel()))
+    stroke_tex = _pack_stroke_texture(packed)
     cell_w = 4096
     cell_h = int(np.ceil(len(counts) / float(cell_w)))
     cbuf = np.zeros((cell_w * cell_h, 2), np.float32)

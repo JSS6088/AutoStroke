@@ -32,14 +32,20 @@ def _load_pure():
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "livepreview.py")
     tree = ast.parse(open(path).read())
-    want = {"pack_strokes", "build_grid", "pack_brush_atlas"}
+    want = {"pack_strokes", "build_grid", "pack_brush_atlas", "stroke_tile_buffer"}
     keep = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in want]
     if len(keep) != len(want):
         raise SystemExit("livepreview.py no longer defines %s"
                          % sorted(want - {n.name for n in keep}))
+    # STROKE_TILE_W is stroke_tile_buffer's default arg value, evaluated when the
+    # function def below executes -- it has to exist in ns first.
+    const = [n for n in tree.body if isinstance(n, ast.Assign)
+             and isinstance(n.targets[0], ast.Name) and n.targets[0].id == "STROKE_TILE_W"]
+    if not const:
+        raise SystemExit("livepreview.py no longer defines STROKE_TILE_W")
     ns = {"np": np, "baker": baker, "geometry": geometry, "INV_SQRT2": INV_SQRT2}
-    exec(compile(ast.Module(body=keep, type_ignores=[]), "<livepreview>", "exec"), ns)
-    return types.SimpleNamespace(**{k: ns[k] for k in want})
+    exec(compile(ast.Module(body=const + keep, type_ignores=[]), "<livepreview>", "exec"), ns)
+    return types.SimpleNamespace(**{k: ns[k] for k in want | {"STROKE_TILE_W"}})
 
 
 LP = _load_pure()
@@ -169,9 +175,53 @@ def main():
 
     debounce()
     shading_normals()
+    stroke_texture_width()
 
     print("\n%s\n" % ("ALL PASS" if not FAILED else "FAILED: " + ", ".join(FAILED)))
     return 1 if FAILED else 0
+
+
+def stroke_texture_width():
+    """stroke_tex's width never grows with stroke count.
+
+    It used to: width was exactly the stroke count, and Metal's MTLTextureDescriptor
+    caps a 2D texture at 16384 texels wide (other backends have their own caps, often
+    similar). A preview past 16384 strokes -- comfortably inside PREVIEW_BUDGET's
+    60,000 -- crashed the whole Blender process with a native GPU assertion: not a
+    Python exception, so nothing in this addon could catch or report it. Fixed by
+    tiling into a fixed-width grid, the same way list_tex already needed to be.
+    """
+    print("\nSTROKE TEXTURE WIDTH NEVER GROWS WITH STROKE COUNT")
+    W = LP.STROKE_TILE_W
+    for n in (1, W - 1, W, W + 1, 20000, 60000):        # 60000 = PREVIEW_BUDGET
+        packed = np.random.default_rng(n).random((n, 4, 4)).astype(np.float32)
+        out = LP.stroke_tile_buffer(packed)
+        check("n=%-6d -> texture width %d (never %d)" % (n, out.shape[1], n),
+              out.shape[1] == W, "shape %s" % (out.shape,))
+        check("n=%-6d -> height is a multiple of 4 (one stroke = 4 texel rows)" % n,
+              out.shape[0] % 4 == 0, "shape %s" % (out.shape,))
+
+    print("\nSTROKE TEXTURE WIDTH: THE PACKING IS LOSSLESS")
+    for n in (1, 5, 4096, 4097, 8500):
+        packed = np.random.default_rng(n + 1).random((n, 4, 4)).astype(np.float32)
+        out = LP.stroke_tile_buffer(packed)
+        ok = True
+        # spot-check every stroke for small n, a sample for large n, matching the
+        # shader's own stroke_row(): (i % W, (i // W) * 4 + row)
+        idx = range(n) if n <= 200 else np.random.default_rng(0).integers(0, n, 200)
+        for i in idx:
+            col, base = i % W, (i // W) * 4
+            for r in range(4):
+                if not np.array_equal(out[base + r, col], packed[i, r]):
+                    ok = False
+                    break
+            if not ok:
+                break
+        check("n=%d: every stroke reads back at the shader's own (i%%W, (i//W)*4+row)"
+              % n, ok)
+
+    check("an empty stroke set does not raise",
+          LP.stroke_tile_buffer(np.zeros((0, 4, 4), np.float32)).shape[1] == W)
 
 
 
