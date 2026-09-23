@@ -72,6 +72,35 @@ def swapped_material(obj, mat):
 
 
 @contextmanager
+def selectable(obj):
+    """Guarantee obj can be selected for the bake, whatever its Outliner state.
+
+    ACTIVE and SELECTED are independent Blender flags; validate()/the panel check only
+    the former. An object can be active -- and read as "ready" -- while hidden or
+    Disable-Selection locked, with no deliberate lock needed: an Outliner click sets
+    active regardless of either, and a reopened .blend restores whichever object was
+    active when saved, hidden or not.
+
+    Cycles' bake operator filters selected_editable_objects, which silently excludes
+    such an object even after select_set(True) appears to succeed -- so without this,
+    the bake proceeds with nothing actually selected and fails with Blender's own
+    opaque "No valid selected objects", with nothing to tell the artist it is about a
+    lock/hide state rather than the selection they can see.
+    """
+    saved_select = obj.hide_select
+    saved_hide = obj.hide_get()
+    obj.hide_select = False
+    if saved_hide:
+        obj.hide_set(False)
+    try:
+        yield
+    finally:
+        obj.hide_select = saved_select
+        if saved_hide:
+            obj.hide_set(True)
+
+
+@contextmanager
 def disabled_geometry_nodes(obj):
     """Bake the surface mesh, not the GN point cloud (which carries no UVs)."""
     disabled = []
@@ -182,7 +211,7 @@ def bake(obj, res, margin=16, channel="position"):
     mat.node_tree.nodes.active = tex
 
     with preserved_bake_settings(scene), disabled_geometry_nodes(obj), \
-            swapped_material(obj, mat):
+            swapped_material(obj, mat), selectable(obj):
         scene.render.engine = 'CYCLES'
         if hasattr(scene, "cycles"):
             scene.cycles.device = 'CPU'
@@ -192,6 +221,21 @@ def bake(obj, res, margin=16, channel="position"):
         bpy.ops.object.select_all(action='DESELECT')
         obj.select_set(True)
         bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.bake(type='EMIT')
+        # select_set() does not raise on failure -- it silently no-ops -- so it is
+        # checked here rather than trusted. Anything past selectable() unlocking
+        # hide_select/hidden is something that cannot be fixed transparently (the
+        # object excluded from the view layer, or a library-linked object), and
+        # deserves a clear reason rather than letting Cycles fail unexplained below.
+        if not obj.select_get() or bpy.context.view_layer.objects.active != obj:
+            raise RuntimeError(
+                "AutoStroke could not select %s to bake it -- it may be excluded "
+                "from the active view layer, or linked from a library. Check the "
+                "Outliner." % obj.name)
+        try:
+            bpy.ops.object.bake(type='EMIT')
+        except RuntimeError as e:
+            raise RuntimeError(
+                "AutoStroke's Cycles bake failed baking the %s map for %s: %s"
+                % (channel, obj.name, e)) from e
 
     return bi.image_to_numpy(img, 3), img
