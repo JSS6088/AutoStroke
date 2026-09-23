@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "autostroke"
-version = "0.10.7"
+version = "0.10.8"
 name = "AutoStroke"
 tagline = "Painterly flat-per-cell texture baking from any mesh"
 maintainer = "Jason <yunfeng2@andrew.cmu.edu>"

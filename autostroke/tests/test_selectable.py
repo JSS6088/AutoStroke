@@ -136,12 +136,19 @@ def configure(bpy_mod, bake_should_fail=None):
                 selected = obj is not None and obj.select_get()
                 if not selected:
                     raise RuntimeError("Error: No valid selected objects")
+                # Real Cycles: Selected to Active bakes FROM every OTHER selected
+                # object ONTO the active one. This fixture only ever selects the
+                # active object itself, so with the setting on there is never a
+                # source -- matching what actually produced the reported bug.
+                if bpy_mod.context.scene.render.bake.use_selected_to_active:
+                    raise RuntimeError("Error: No valid selected objects")
                 if bake_should_fail is not None and bake_should_fail(obj):
                     raise RuntimeError("Error: some other Cycles failure")
 
     bpy_mod.context = types.SimpleNamespace(scene=types.SimpleNamespace(
         render=types.SimpleNamespace(engine='CYCLES',
-                                     bake=types.SimpleNamespace(margin=16, use_clear=True)),
+                                     bake=types.SimpleNamespace(margin=16, use_clear=True,
+                                                                use_selected_to_active=True)),
         cycles=types.SimpleNamespace(device='CPU', samples=1)),
         view_layer=_ViewLayer())
     bpy_mod.ops = _Ops()
@@ -255,6 +262,30 @@ def main():
         pass
     check("hide_select restored after an exception", obj3.hide_select is True)
     check("hidden restored after an exception", obj3.hide_get() is True)
+
+    print("\nBAKE() TURNS OFF SELECTED-TO-ACTIVE, RESTORES IT AFTER")
+    # Cycles' "Selected to Active" bakes FROM every other selected object ONTO the
+    # active one -- a high-poly-to-low-poly workflow. This function selects exactly
+    # one object, so with that setting left on (as configure() defaults it, matching
+    # a .blend that carries it from unrelated prior work) Cycles finds no source
+    # objects and refuses with "No valid selected objects" -- even though the object
+    # IS genuinely selected, active, unlocked and visible. This was the actual
+    # reported bug; hide_select/hidden (above) is a separate, previously-fixed one.
+    calls = configure(bpy_mod)
+    bake_render = bpy_mod.context.scene.render.bake
+    obj7 = FakeObj(name="Stone Ground")
+    check("use_selected_to_active starts ON (simulating a carried-over .blend)",
+          bake_render.use_selected_to_active is True)
+    try:
+        position.bake(obj7, 64, channel="position")
+        ok, detail = True, "%d bake call(s)" % calls["bake"]
+    except Exception as e:
+        ok, detail = False, "%s: %s" % (type(e).__name__, e)
+    check("bake() succeeds instead of reporting a phantom selection problem",
+          ok, detail)
+    check("use_selected_to_active is restored to True afterward",
+          bake_render.use_selected_to_active is True,
+          "must not leave the artist's own setting changed")
 
     print("\nBAKE() NOW SUCCEEDS ON A LOCKED/HIDDEN OBJECT")
     obj4 = FakeObj(hide_select=True, hidden=True)

@@ -24,22 +24,35 @@ CHANNELS = {
 
 @contextmanager
 def preserved_bake_settings(scene):
-    """Restore every render setting the bake touches, however it exits."""
+    """Restore every render setting the bake touches, however it exits.
+
+    Forces `use_selected_to_active` off here rather than merely saving it, because it
+    is not something bake() ever wants on: that mode bakes FROM every other selected
+    object ONTO the active one (a high-poly-to-low-poly workflow), and this function
+    selects exactly one object. With it left on -- a scene setting that persists in
+    the .blend and is easy to have turned on from unrelated prior work -- Cycles finds
+    no source objects and refuses with its own "No valid selected objects", which was
+    genuinely confusing to debug: the object IS selected and active, just not in the
+    mode this setting demands.
+    """
     saved = {
         "engine": scene.render.engine,
         "margin": scene.render.bake.margin,
         "use_clear": scene.render.bake.use_clear,
+        "use_selected_to_active": scene.render.bake.use_selected_to_active,
     }
     has_cycles = hasattr(scene, "cycles")
     if has_cycles:
         saved["device"] = scene.cycles.device
         saved["samples"] = scene.cycles.samples
+    scene.render.bake.use_selected_to_active = False
     try:
         yield
     finally:
         scene.render.engine = saved["engine"]
         scene.render.bake.margin = saved["margin"]
         scene.render.bake.use_clear = saved["use_clear"]
+        scene.render.bake.use_selected_to_active = saved["use_selected_to_active"]
         if has_cycles:
             scene.cycles.device = saved["device"]
             scene.cycles.samples = saved["samples"]
