@@ -108,6 +108,29 @@ this triangle's points. Position uses depth 32. Two different depths on purpose:
 track how much surface a stroke is responsible for, position should not depend on how many
 points were asked for.
 
+**The size cap.** Max Strokes per Face bounds *count*, not size. Once a face's natural count
+(area × density) passes that cap, `leaf_area = face_area / max_strokes` keeps growing exactly
+as fast as the face does, and `r` above has no ceiling — measured, a 1024× range of face area
+under a fixed cap of 128 produced a 32× range of stroke radius, unbounded.
+
+The fix asymptotes toward `R = 1/√density` rather than inventing a new limit: on any face with
+room to reach the target density (not clamped by Min/Max), `leaf_area → 1/density` in the
+limit and `r` already converges to exactly `R` on its own — measured within 0.3% a thousand
+times past the reference area, before the cap ever bites. `R` is therefore the size the rest
+of the mesh is *already* using; a capped face asymptoting toward it looks proportionate
+instead of erupting.
+
+```
+r_final = R · tanh(r / R)
+```
+
+`tanh(x) ≈ x` for `x ≪ 1`, so a normal, uncapped stroke (`r ≪ R`) is touched by a fraction of a
+percent — measured 0.3% at `r = R/10`. As `r` approaches or passes `R` the curve bends over
+smoothly and never exceeds it, which is the point: two capped faces of slightly different area
+should look like a smooth falloff, not a hard clip that shows as a visible size discontinuity
+between them. `density` is optional on `stroke_radius` — omit it and the formula above is
+untouched, which is what every caller that predates this did and still does.
+
 ## 1.4 Which way each stroke points
 
 Strokes run along the surface's **least-curved direction**, so they follow the form rather

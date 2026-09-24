@@ -166,8 +166,8 @@ def tri_aspect(P, Q, R):
     return np.where(A > 1e-30, L * L / (2.0 * np.maximum(A, 1e-30)), 1.0)
 
 
-def stroke_radius(leaf_area, leaf_aspect, alpha=0.5, ideal_aspect=2.0):
-    """r = sqrt(a) * (aspect / ideal)^alpha.
+def stroke_radius(leaf_area, leaf_aspect, alpha=0.5, ideal_aspect=2.0, density=None):
+    """r = sqrt(a) * (aspect / ideal)^alpha, softly capped toward 1/sqrt(density).
 
     sqrt(a) is the side of a SQUARE of that area, so it matches a face's real extent only
     when the face is compact. A sliver of length L and width w needs r ~ L/2 while
@@ -177,8 +177,34 @@ def stroke_radius(leaf_area, leaf_aspect, alpha=0.5, ideal_aspect=2.0):
 
     Dividing by the ideal keeps compact faces near their old size: an equilateral's leaves
     sit at aspect 2.31, so an uncorrected sqrt(aspect) would enlarge every stroke by 1.5x.
+
+    Max Strokes per Face bounds stroke COUNT on a face, not stroke SIZE. Once a face's
+    natural count (area x density) exceeds that cap, leaf_area = face_area / max_strokes
+    keeps growing exactly as fast as the face does -- radius above grows unboundedly with
+    it, with no ceiling, which is what makes one huge flat face erupt into a handful of
+    oversized strokes while everything else on the mesh stays normal.
+
+    `density` (strokes per m^2, from solve_density) is exactly the number that already
+    tells you what a stroke SHOULD be, uncapped: on any face with enough room to hit that
+    density (not clamped by Min/Max), leaf_area -> 1/density in the limit and the radius
+    above already converges to R = 1/sqrt(density) on its own (measured: within 0.3% of a
+    face 1000x the reference area, before this cap ever bites). That is not a coincidence
+    to route around -- it is the size the rest of the mesh is already using, so it is the
+    natural target to asymptote toward rather than invent a new one.
+
+    Passing `density` applies r_final = R * tanh(r_raw / R): near-identity for r_raw well
+    under R (a cubic correction, invisible on any normal stroke), bending over smoothly
+    and never exceeding R as r_raw grows past it -- "grows like a curve, then flattens
+    out," not a hard clip that would show as a visible size discontinuity between two
+    similarly-capped faces of slightly different area. Omitting `density` (the default)
+    reproduces the exact uncapped formula -- every existing caller and test is
+    unaffected until it opts in.
     """
-    return np.sqrt(leaf_area) * np.power(np.maximum(leaf_aspect, 1e-12) / ideal_aspect, alpha)
+    r = np.sqrt(leaf_area) * np.power(np.maximum(leaf_aspect, 1e-12) / ideal_aspect, alpha)
+    if density is None:
+        return r
+    R = 1.0 / np.sqrt(np.maximum(density, 1e-12))
+    return R * np.tanh(r / R)
 
 
 def sample_faces(tri_P, tri_Q, tri_R, face_of_tri, counts, depth=32,

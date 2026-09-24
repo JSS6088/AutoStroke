@@ -117,7 +117,11 @@ def build_seeds(obj, target_strokes, min_strokes=1, max_strokes=128, alpha=0.5,
     nrm = M.barycentric_normal(pos, m["P"][t], m["Q"][t], m["R"][t],
                                m["nP"][t], m["nQ"][t], m["nR"][t])
 
-    radius = S.stroke_radius(leaf_area, leaf_aspect, alpha=alpha)
+    # density is what lets a count-capped face's radius asymptote toward the size
+    # every OTHER (uncapped) face on the mesh is already using, instead of growing
+    # without bound as leaf_area = face_area / max_strokes keeps climbing with the
+    # face -- see stroke_radius's own docstring for the derivation.
+    radius = S.stroke_radius(leaf_area, leaf_aspect, alpha=alpha, density=density)
 
     seeds = dict(
         position=pos.astype(np.float32),

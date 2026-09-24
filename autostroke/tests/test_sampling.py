@@ -166,6 +166,55 @@ def main():
           closest >= 0.6 and holeq <= 1.0,
           "closest %.2fx  hole %.2fx  (four-way: 0.67x / 0.87x)" % (closest, holeq))
 
+    # --- 6. the size cap: a count-capped face must not keep growing ---------
+    # This is the actual reported bug: Max Strokes per Face bounds COUNT, not size, so
+    # leaf_area = face_area / max_strokes grows exactly as fast as the face once capped,
+    # and radius (uncorrected) grows without bound right along with it.
+    print("\nSTROKE SIZE STOPS GROWING ONCE A FACE IS COUNT-CAPPED")
+    areas = np.concatenate([np.full(50, 1.0), [16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0]])
+    big = np.array([16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0])
+
+    density, _ = S.solve_density(areas, target=2000, min_strokes=1, max_strokes=128)
+    counts = S.stroke_counts(areas, density, min_strokes=1, max_strokes=128)
+    leaf_at = {a: areas[np.where(areas == a)[0][-1]] / max(counts[np.where(areas == a)[0][-1]], 1)
+              for a in big}
+
+    uncapped = np.array([S.stroke_radius(np.array([leaf_at[a]]), np.array([2.0]))[0]
+                         for a in big])
+    check("without density: confirms the bug -- radius keeps growing, ~32x end to end",
+          uncapped[-1] / uncapped[0] > 20,
+          "%.2f -> %.2f (x%.1f)" % (uncapped[0], uncapped[-1], uncapped[-1] / uncapped[0]))
+
+    capped = np.array([S.stroke_radius(np.array([leaf_at[a]]), np.array([2.0]),
+                                       density=density)[0] for a in big])
+    R = 1.0 / np.sqrt(density)
+    check("with density: every capped face stays under the natural ceiling",
+          bool((capped <= R * 1.001).all()),
+          "R=%.3f, max seen %.3f" % (R, capped.max()))
+    check("...and the growth from smallest to largest capped face is dramatically tamed",
+          capped[-1] / capped[0] < 3.0,
+          "%.2f -> %.2f (x%.1f, vs x%.1f uncapped)"
+          % (capped[0], capped[-1], capped[-1] / capped[0], uncapped[-1] / uncapped[0]))
+
+    # small, NOT count-capped strokes must be practically unaffected -- this is the
+    # backward-compatibility half of the same claim, not just "does it cap". density=100
+    # gives R=0.1; leaf_area=0.0001 gives a raw radius of 0.01, a tenth of R -- well
+    # inside the near-identity region, not sitting AT the ceiling itself.
+    small = S.stroke_radius(np.array([0.0001]), np.array([2.0]), density=100.0)[0]
+    small_raw = S.stroke_radius(np.array([0.0001]), np.array([2.0]))[0]
+    check("a normal, well-under-the-ceiling stroke is barely touched",
+          abs(small - small_raw) / small_raw < 0.02,
+          "%.6f vs %.6f (%.2f%% difference)"
+          % (small, small_raw, 100 * abs(small - small_raw) / small_raw))
+
+    # density=None (the default, every OTHER call in this file) must reproduce the
+    # exact uncapped formula -- no caller anywhere else in the codebase opts in by
+    # accident.
+    exact = float(S.stroke_radius(np.array([5.0]), np.array([3.0]))[0])
+    expect = float(np.sqrt(5.0) * (3.0 / 2.0) ** 0.5)
+    check("omitting density changes nothing (exact match, not just 'close')",
+          exact == expect, "%.10f vs %.10f" % (exact, expect))
+
     print("\n%s" % ("ALL PASS" if not fails else "FAILED: " + ", ".join(fails)))
     return 1 if fails else 0
 
