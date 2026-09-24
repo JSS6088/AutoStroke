@@ -122,30 +122,129 @@ def mesh_signature(obj):
     return mesh_bridge.signature(obj)
 
 
+def targets(context):
+    """Objects this bake will process, in a stable order.
+
+    Every selected MESH that passes validate(), sorted by name -- context's own
+    selection order is Blender's internal selection stack (last-clicked last, or
+    arbitrary after undo/linking), which an artist has no way to see or predict, while
+    name order is exactly what the Outliner already shows them.
+
+    Falls back to [active_object] when that set is empty, so "nothing extra selected,
+    just press Bake" -- every workflow this addon has ever supported -- behaves
+    identically to before this function existed. An object can be active without being
+    selected (see bridge/position.py's own selectable() docstring for how), so the
+    active object is folded in even when it is not in context.selected_objects, matching
+    what poll()/the panel have always keyed off.
+    """
+    seen = {o.name: o for o in context.selected_objects if o.type == 'MESH'}
+    active = context.active_object
+    if active is not None and active.type == 'MESH':
+        seen.setdefault(active.name, active)
+    ok = sorted((o for o in seen.values() if not setup_ops.validate(o)),
+               key=lambda o: o.name)
+    if ok:
+        return ok
+    if active is not None and not setup_ops.validate(active):
+        return [active]
+    return []
+
+
+class Job:
+    """One object's worth of bake state -- what used to be flat attributes on the
+    operator itself, back when there was only ever one object to bake.
+
+    `t0` is this object's OWN start time, not the batch's: `_write` measures "how long
+    did THIS bake take" from it, and that feeds directly into est_scale's calibration
+    (which assumes elapsed time corresponds to this object's own stroke count). Sharing
+    one clock across every job in a batch would make every object after the first look
+    slower than it was and would corrupt the calibration on every one of them.
+    """
+
+    def __init__(self, obj):
+        self.obj = obj
+        self.t0 = None
+        self.stem = None
+        self.pos_note = None
+        self.surf_nrm = None
+        self.seeds = None
+        self.sstats = None
+        self.seed_tan = None
+        self.curv = None
+        self.H = None
+        self.W = None
+        self.valid = None
+        self.uv_self = None
+        self.gen = None
+        self.result = None
+        self.error = None          # set on failure; the job is skipped, not fatal
+        self.secs = None           # set by _write(): this job's own elapsed time
+        self.coverage = None       # set by _write(): percent of valid texels covered
+
+
 class AUTOSTROKE_OT_bake(bpy.types.Operator):
     bl_idname = "autostroke.bake"
     bl_label = "Bake"
-    bl_description = "Bake the indirection map and its debug maps"
+    bl_description = "Bake the indirection map and its debug maps for every selected mesh"
     bl_options = {'REGISTER', 'UNDO'}
 
     _timer = None
 
     @classmethod
     def poll(cls, context):
-        return not setup_ops.validate(context.active_object)
+        return bool(targets(context))
 
     # ---- setup ------------------------------------------------------------
     def invoke(self, context, event):
         st = context.scene.autostroke
-        obj = context.active_object
-        self._t0 = time.time()
+        objs = targets(context)
+        if not objs:
+            self.report({'ERROR'}, "No valid mesh objects selected")
+            return {'CANCELLED'}
+
+        self._batch_t0 = time.time()
         self.stages = Stages()
+        self.done, self.failed = [], []
         try:
+            # Everything here is scene-derived, not object-dependent -- computed once
+            # and shared read-only across every job, exactly as it was the only bake.
             self.workdir = resolve_working_dir(st)
-            self.stem = safe_name(obj.name)
             with self.stages("brushes"):
                 self.mask, self.brush_set = load_brush(st, Config())
             self.cfg = config_from_settings(st, self.mask)
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        self.jobs = [Job(o) for o in objs]
+        self.i = 0
+
+        wm = context.window_manager
+        wm.progress_begin(0.0, 1.0)
+        self._timer = wm.event_timer_add(0.05, window=context.window)
+        wm.modal_handler_add(self)
+        self._progress = 0.0
+        if self._start_job(context, self.jobs[0]):
+            return {'RUNNING_MODAL'}
+        # The very first object failed before it could even start resolving --
+        # _advance() is the same recovery path modal() uses mid-batch, so this does
+        # not need its own separate handling.
+        return self._advance(context)
+
+    def _start_job(self, context, job):
+        """Position/normal map -> seeds -> direction field -> the resolve_uv generator,
+        for one object. Everything ops/bake.py used to do once in invoke(), now scoped
+        to `job` instead of `self` so a batch can run it once per object.
+
+        Returns True on success (job.gen is ready for modal() to advance) or False,
+        having recorded job.error, on a caught (RuntimeError, MeshError) -- a failure
+        here skips this one object rather than cancelling the whole operator.
+        """
+        st = context.scene.autostroke
+        obj = job.obj
+        job.t0 = time.time()
+        try:
+            job.stem = safe_name(obj.name)
             res = int(st.resolution)
 
             # --- position map: cached against mesh + UV + resolution ---------
@@ -155,8 +254,8 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
             # keyed per resolution, or previewing and baking would evict each other's
             # position map on every switch
             sig_key = "%s_%d" % (SIG_KEY, res)
-            path = os.path.join(self.workdir, "%s_position.exr" % self.stem)
-            npath = os.path.join(self.workdir, "%s_surface_normal.exr" % self.stem)
+            path = os.path.join(self.workdir, "%s_position.exr" % job.stem)
+            npath = os.path.join(self.workdir, "%s_surface_normal.exr" % job.stem)
             cached = (not st.force_position_bake and obj.get(sig_key) == sig
                       and os.path.exists(path) and os.path.exists(npath))
             if cached:
@@ -165,49 +264,61 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
                 with self.stages("read maps"):
                     pos_img = bi.image_to_numpy(
                         bpy.data.images.load(path, check_existing=True), 3)
-                    self.surf_nrm = bi.image_to_numpy(
+                    job.surf_nrm = bi.image_to_numpy(
                         bpy.data.images.load(npath, check_existing=True), 3)
-                self.pos_note = "position: cached"
+                job.pos_note = "position: cached"
             else:
                 context.window.cursor_set('WAIT')
+                # Exactly one Cycles bake in flight at a time, always: pos_bridge.bake
+                # reuses a single shared material+image datablock per channel across
+                # every object, and is only safe because each call fully completes and
+                # saves before the next one starts -- which invoke()/_advance() never
+                # violate, since a new job's position bake only ever begins after the
+                # previous job's _write() has already returned.
                 with self.stages("cycles bake"):
                     pos_img, img = pos_bridge.bake(obj, res, channel="position")
                     bi.save_image(img, path)
                 # The TRUE surface normal, so texels no stamp covered fall back to real
                 # shading instead of the (-1,-1,-1) that an all-zero debug map decodes to.
                 with self.stages("cycles bake"):
-                    self.surf_nrm, nimg = pos_bridge.bake(obj, res, channel="normal")
+                    job.surf_nrm, nimg = pos_bridge.bake(obj, res, channel="normal")
                     bi.save_image(nimg, npath)
                 obj[sig_key] = sig
                 context.window.cursor_set('DEFAULT')
-                self.pos_note = "position: baked"
+                job.pos_note = "position: baked"
 
             # --- seeds and direction: cached across look changes -------------
             # Neither depends on resolution, brush, Stroke Size, Size Variation, rotation,
             # jitter or cutoff -- every look dial except Stroke Count and the clamps. The
             # direction field is ~N^1.7, so at high stroke counts this IS the preview
             # budget. Keyed on the evaluated-mesh hash, so a moved vertex invalidates it.
+            #
+            # One slot, deliberately: this evicts whatever the PREVIOUS job in this same
+            # batch cached, exactly as switching objects and re-baking already did before
+            # a batch could exist. A batch still processes one object at a time in
+            # sequence, so an unbounded per-object cache would just be a memory leak with
+            # extra steps.
             ckey = seed_cache.key(mesh_sig, self.cfg.target_strokes, self.cfg.min_strokes,
                                   self.cfg.max_strokes, self.cfg.aspect_alpha)
             hit = seed_cache.get(ckey)
             if hit is not None:
-                seeds, sstats, seed_tan, self.curv = hit
+                seeds, sstats, seed_tan, job.curv = hit
             else:
                 with self.stages("seeds"):
                     context.view_layer.update()
                     seeds, sstats = seed_bridge.build_seeds(
                         obj, self.cfg.target_strokes, min_strokes=self.cfg.min_strokes,
                         max_strokes=self.cfg.max_strokes, alpha=self.cfg.aspect_alpha)
-                seed_tan, self.curv = None, None
+                seed_tan, job.curv = None, None
                 if self.cfg.direction_source == "curvature":
                     with self.stages("direction"):
-                        seed_tan, self.curv = geometry.compute_direction_field(
+                        seed_tan, job.curv = geometry.compute_direction_field(
                             seeds["position"].astype(np.float32),
                             seeds["normal"].astype(np.float32), self.cfg)
-                seed_cache.put(ckey, seeds, sstats, seed_tan, self.curv)
-            self.seeds = seeds
-            self.sstats = sstats
-            self.seed_tan = seed_tan
+                seed_cache.put(ckey, seeds, sstats, seed_tan, job.curv)
+            job.seeds = seeds
+            job.sstats = sstats
+            job.seed_tan = seed_tan
 
             # Flow angle only: lining each brush up with the stroke direction is now
             # resolve_uv's job, because every brush in the set is drawn at its own angle
@@ -216,39 +327,33 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
 
             # --- texel setup -------------------------------------------------
             H, W, _ = pos_img.shape
-            self.H, self.W = H, W
+            job.H, job.W = H, W
             flat = pos_img.reshape(-1, 3)
-            self.valid = ((np.abs(flat) > self.cfg.bg_eps).any(1)
-                          & np.isfinite(flat).all(1))
+            job.valid = ((np.abs(flat) > self.cfg.bg_eps).any(1)
+                        & np.isfinite(flat).all(1))
             ys, xs = np.divmod(np.arange(H * W), W)
-            self.uv_self = np.empty((H * W, 2), np.float32)
-            self.uv_self[:, 0] = (xs + 0.5) / W
-            self.uv_self[:, 1] = 1.0 - (ys + 0.5) / H
+            job.uv_self = np.empty((H * W, 2), np.float32)
+            job.uv_self[:, 0] = (xs + 0.5) / W
+            job.uv_self[:, 1] = 1.0 - (ys + 0.5) / H
 
             seed_r = seeds["radius"].astype(np.float32)
             # The crease guard compares each texel's own normal against the stroke's, so
             # it needs the surface normal map -- already baked above for the uncovered
             # fallback, and in the same object space as the seed normals.
-            flat_n = self.surf_nrm.reshape(-1, 3)
+            flat_n = job.surf_nrm.reshape(-1, 3)
 
-            self.gen = baker.resolve_uv(
-                flat[self.valid], self.uv_self[self.valid],
+            job.gen = baker.resolve_uv(
+                flat[job.valid], job.uv_self[job.valid],
                 seeds["position"].astype(np.float32), seeds["id"].astype(np.int64),
                 seeds["UVMap"].astype(np.float32), seed_r,
                 seeds["normal"].astype(np.float32),
                 None, self.mask, self.cfg, seed_tan, stamp_rot,
-                pt_nrm=flat_n[self.valid])
+                pt_nrm=flat_n[job.valid])
+            return True
         except (RuntimeError, mesh_bridge.MeshError) as e:
             context.window.cursor_set('DEFAULT')
-            self.report({'ERROR'}, str(e))
-            return {'CANCELLED'}
-
-        wm = context.window_manager
-        wm.progress_begin(0.0, 1.0)
-        self._timer = wm.event_timer_add(0.05, window=context.window)
-        wm.modal_handler_add(self)
-        self._progress = 0.0
-        return {'RUNNING_MODAL'}
+            job.error = str(e)
+            return False
 
     # ---- the chunked loop --------------------------------------------------
     def modal(self, context, event):
@@ -256,20 +361,43 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
             return self._finish(context, cancelled=True)
         if event.type != 'TIMER':
             return {'PASS_THROUGH'}
+        job = self.jobs[self.i]
         deadline = time.time() + 0.1          # keep the UI at ~10fps
         t0 = time.time()
         try:
             while time.time() < deadline:
-                self._progress = next(self.gen)
+                self._progress = next(job.gen)
         except StopIteration as stop:
             self.stages.add("resolve", time.time() - t0)
-            self.result = stop.value
-            return self._finish(context)
+            job.result = stop.value
+            try:
+                self._write(context, job)
+                self.done.append(job)
+            except RuntimeError as e:
+                self.failed.append((job.obj.name, str(e)))
+            return self._advance(context)
         self.stages.add("resolve", time.time() - t0)
-        context.window_manager.progress_update(self._progress)
-        context.area.header_text_set("AutoStroke  %.0f%%   (Esc to cancel)"
-                                     % (100 * self._progress))
+        frac = (self.i + self._progress) / len(self.jobs)
+        context.window_manager.progress_update(frac)
+        context.area.header_text_set(
+            "AutoStroke  Object %d/%d: %s — %.0f%%   (Esc to cancel)"
+            % (self.i + 1, len(self.jobs), job.obj.name, 100 * self._progress))
         return {'RUNNING_MODAL'}
+
+    def _advance(self, context):
+        """Move past self.i, starting the next job's position bake -- only once the
+        one that just finished has fully written its output and built its material, so
+        two objects' Cycles bakes can never overlap. Skips (rather than aborts on) any
+        job whose own setup fails, continuing until one starts or the queue is empty.
+        """
+        self.i += 1
+        while self.i < len(self.jobs):
+            job = self.jobs[self.i]
+            if self._start_job(context, job):
+                return {'RUNNING_MODAL'}
+            self.failed.append((job.obj.name, job.error))
+            self.i += 1
+        return self._finish(context)
 
     # ---- teardown ----------------------------------------------------------
     def _finish(self, context, cancelled=False):
@@ -281,20 +409,21 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
         if cancelled:
             self.report({'WARNING'}, "Bake cancelled")
             return {'CANCELLED'}
-        try:
-            self._write(context)
-        except RuntimeError as e:
-            self.report({'ERROR'}, str(e))
+        self._report_batch(context)
+        if not self.done:
             return {'CANCELLED'}
         return {'FINISHED'}
 
-    def _write(self, context):
-        st = context.scene.autostroke
-        uv_out, dbg_out, covered, lum_out = self.result
-        H, W, cfg, valid = self.H, self.W, self.cfg, self.valid
+    def _write(self, context, job):
+        """Turn one finished job's resolve_uv output into two EXRs plus a material.
+        Raises RuntimeError on failure -- the CALLER (modal()) decides whether that
+        skips this one object or is fatal; this function itself never touches self.i
+        or the job queue."""
+        uv_out, dbg_out, covered, lum_out = job.result
+        H, W, cfg, valid = job.H, job.W, self.cfg, job.valid
 
         indir = np.zeros((H * W, 3), np.float32)
-        indir[:, :2] = self.uv_self
+        indir[:, :2] = job.uv_self
         indir[:, 2] = 0.5
         indir[valid, :2] = uv_out
         indir[valid, 2] = lum_out
@@ -302,7 +431,7 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
         # are pass-through, so they should shade like the untouched model.
         dbg = np.zeros((H * W, 3), np.float32)
         dbg[valid] = dbg_out
-        nrm = self.surf_nrm.reshape(-1, 3)
+        nrm = job.surf_nrm.reshape(-1, 3)
         nl = np.linalg.norm(nrm, axis=1, keepdims=True)
         nrm = np.divide(nrm, nl, out=np.zeros_like(nrm), where=nl > 1e-9)
         uncovered = np.zeros(H * W, bool)
@@ -320,38 +449,75 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
         # numpy -> image datablock (img.pixels again) -> EXR on disk
         with self.stages("write maps"):
             for key, arr in maps.items():
-                bi.write_map(arr, "%s_%s" % (self.stem, key),
-                             os.path.join(self.workdir, "%s_%s.exr" % (self.stem, key)))
+                bi.write_map(arr, "%s_%s" % (job.stem, key),
+                             os.path.join(self.workdir, "%s_%s.exr" % (job.stem, key)))
 
         n_val, n_cov = int(valid.sum()), int(covered.sum())
-        secs = time.time() - self._t0
-        ss = self.sstats
-        st.last_report = (
-            "%.1f%% coverage · %s strokes · %s|"
-            "stroke radius %.4f u · faces at min %.0f%%, at max %.0f%%|"
-            "brushes: %s (%d) · %s|%s"
-            % (100.0 * n_cov / max(n_val, 1), "{:,}".format(ss["strokes"]),
-               ("%.0fs" % secs) if secs < 90 else ("%.1f min" % (secs / 60)),
-               ss["radius_med"], 100 * ss["at_min"], 100 * ss["at_max"],
-               self.brush_set, len(self.mask), self.pos_note,
-               self.stages.line(secs)))
-        self.stages.report(secs)
-        # Feed the real time back so the panel's estimate learns this machine and model.
+        job.secs = time.time() - job.t0
+        job.coverage = 100.0 * n_cov / max(n_val, 1)
+        ss = job.sstats
+        # Feed the real time back so the panel's estimate learns this machine and model
+        # -- once per job, each against its OWN elapsed time, not the batch's.
         from ..core import cost
+        st = context.scene.autostroke
         st.est_scale = cost.calibration(
-            secs, cost.bake_seconds(int(st.resolution), max(ss["strokes"], 1),
-                                    st.stroke_size, scale=1.0),
+            job.secs, cost.bake_seconds(int(st.resolution), max(ss["strokes"], 1),
+                                        st.stroke_size, scale=1.0),
             previous=st.est_scale)
-        obj = context.active_object
         try:
             from . import material as material_ops
             with self.stages("material"):
-                material_ops.build(obj)
+                material_ops.build(job.obj)
         except RuntimeError as e:
-            self.report({'WARNING'}, "Maps baked but material failed: %s" % e)
+            self.report({'WARNING'}, "Maps baked but material failed for %s: %s"
+                        % (job.obj.name, e))
 
-        self.report({'INFO'}, "AutoStroke: %.1f%% coverage in %.0fs"
-                    % (100.0 * n_cov / max(n_val, 1), secs))
+    def _report_batch(self, context):
+        """Assemble st.last_report (still one '|'-joined string, so the panel's
+        existing render needs no change) and the final transient self.report().
+        Single-object output is byte-identical to before batching existed; anything
+        more becomes a summary line plus one compact line per object."""
+        st = context.scene.autostroke
+        total_secs = time.time() - self._batch_t0
+
+        if len(self.jobs) == 1 and len(self.done) == 1:
+            job = self.done[0]
+            ss = job.sstats
+            st.last_report = (
+                "%.1f%% coverage · %s strokes · %s|"
+                "stroke radius %.4f u · faces at min %.0f%%, at max %.0f%%|"
+                "brushes: %s (%d) · %s|%s"
+                % (job.coverage, "{:,}".format(ss["strokes"]),
+                   ("%.0fs" % job.secs) if job.secs < 90 else ("%.1f min" % (job.secs / 60)),
+                   ss["radius_med"], 100 * ss["at_min"], 100 * ss["at_max"],
+                   self.brush_set, len(self.mask), job.pos_note,
+                   self.stages.line(job.secs)))
+            self.stages.report(job.secs)
+            self.report({'INFO'}, "AutoStroke: %.1f%% coverage in %.0fs"
+                        % (job.coverage, job.secs))
+            return
+
+        lines = ["%d object%s · %d baked, %d failed · %s total" % (
+            len(self.jobs), "" if len(self.jobs) == 1 else "s",
+            len(self.done), len(self.failed),
+            ("%.0fs" % total_secs) if total_secs < 90 else ("%.1f min" % (total_secs / 60)))]
+        for job in self.done:
+            lines.append("%s: %.1f%% coverage · %s strokes · %.0fs"
+                         % (job.obj.name, job.coverage,
+                            "{:,}".format(job.sstats["strokes"]), job.secs))
+        for name, detail in self.failed:
+            lines.append("failed: %s — %s" % (name, detail))
+        st.last_report = "|".join(lines)
+        self.stages.report(total_secs)
+
+        if self.failed:
+            names = ", ".join(n for n, _d in self.failed[:5])
+            more = "" if len(self.failed) <= 5 else " (+%d more)" % (len(self.failed) - 5)
+            self.report({'WARNING'}, "AutoStroke: %d/%d baked in %.0fs — failed: %s%s"
+                        % (len(self.done), len(self.jobs), total_secs, names, more))
+        else:
+            self.report({'INFO'}, "AutoStroke: %d/%d baked in %.0fs"
+                        % (len(self.done), len(self.jobs), total_secs))
 
 
 classes = (AUTOSTROKE_OT_bake,)

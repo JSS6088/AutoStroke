@@ -5,6 +5,7 @@ import bpy
 
 from .. import livepreview
 from ..bridge import brushes as brush_bridge
+from ..ops import bake as bake_ops
 from ..ops import setup as setup_ops
 
 
@@ -44,6 +45,30 @@ def _estimate(context, obj):
     return strokes, secs, at_min, at_max
 
 
+def _estimate_batch(context, objs):
+    """_estimate(), summed across every object Bake will actually process.
+
+    Stays exactly as cheap as _estimate() itself: predicted_total() and the density
+    solve below both read obj.data.polygons directly (no to_mesh(), no depsgraph), so
+    looping this over a selection is still plain numpy work per object, not N depsgraph
+    evaluations -- safe to call on every panel redraw the same way the single-object
+    version always has been.
+
+    at_min/at_max are OR'd across the selection rather than kept per-object: "is ANY
+    selected object capped" is the one thing worth a warning at a glance; a per-object
+    breakdown would just be noise until an artist actually suspects a specific object.
+    """
+    total_strokes, total_secs = 0, 0.0
+    any_at_min = any_at_max = False
+    for obj in objs:
+        s, t, amin, amax = _estimate(context, obj)
+        total_strokes += s
+        total_secs += t          # objects bake sequentially, never in parallel -- sum is right
+        any_at_min = any_at_min or amin > 0.5
+        any_at_max = any_at_max or amax > 0.5
+    return total_strokes, total_secs, any_at_min, any_at_max
+
+
 def _fmt_time(s):
     if s < 90:
         return "%.0fs" % s
@@ -62,22 +87,39 @@ class AUTOSTROKE_PT_main(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         st = context.scene.autostroke
-        obj = context.active_object
+        # The single source of truth for "which objects will Bake actually process" --
+        # imported rather than reimplemented, so the readiness line below and what
+        # pressing Bake does can never disagree about the answer.
+        objs = bake_ops.targets(context)
 
-        problems = setup_ops.validate(obj)
-        if problems:
+        if not objs:
+            problems = setup_ops.validate(context.active_object)
             box = layout.box()
             for p in problems:
                 box.label(text=p, icon='ERROR')
             return
 
-        layout.label(text="%s  ready" % obj.name, icon='CHECKMARK')
+        if len(objs) == 1:
+            layout.label(text="%s  ready" % objs[0].name, icon='CHECKMARK')
+        else:
+            layout.label(text="%d objects ready" % len(objs), icon='CHECKMARK')
+            names = layout.box()
+            for o in objs:
+                names.label(text=o.name)
 
-        legacy = setup_ops.legacy_modifier(obj)
-        if legacy is not None and legacy.show_viewport:
+        legacy_names = []
+        for o in objs:
+            mod = setup_ops.legacy_modifier(o)
+            if mod is not None and mod.show_viewport:
+                legacy_names.append(o.name)
+        if legacy_names:
             warn = layout.box()
             warn.label(text="Old seeder modifier is still active", icon='ERROR')
-            warn.label(text="Strokes are placed by this panel now.")
+            if len(objs) > 1:
+                warn.label(text="on: %s" % ", ".join(legacy_names))
+                warn.label(text="The button below only disables it on the active object.")
+            else:
+                warn.label(text="Strokes are placed by this panel now.")
             warn.operator("autostroke.disable_legacy", icon='CANCEL')
 
         box = layout.box()
@@ -100,13 +142,23 @@ class AUTOSTROKE_PT_main(bpy.types.Panel):
         if live:
             box.label(text="Min/Max per Face locked while previewing", icon='LOCKED')
         box.prop(st, "crease_angle")
-        strokes, secs, at_min, at_max = _estimate(context, obj)
-        box.label(text="~ %s strokes  ·  bake ~ %s" % ("{:,}".format(strokes), _fmt_time(secs)),
-                  icon='INFO' if secs < 300 else 'ERROR')
+        if len(objs) == 1:
+            strokes, secs, at_min, at_max = _estimate(context, objs[0])
+        else:
+            strokes, secs, at_min, at_max = _estimate_batch(context, objs)
+        label = ("~ %s strokes  ·  bake ~ %s" % ("{:,}".format(strokes), _fmt_time(secs))
+                 if len(objs) == 1 else
+                 "~ %s strokes total  ·  bake ~ %s total across %d objects"
+                 % ("{:,}".format(strokes), _fmt_time(secs), len(objs)))
+        box.label(text=label, icon='INFO' if secs < 300 else 'ERROR')
         if strokes:
             capped = at_max > 0.5
-            box.label(text="faces at min %.0f%%   at max %.0f%%" % (100 * at_min, 100 * at_max),
-                      icon='ERROR' if capped else 'NONE')
+            if len(objs) == 1:
+                box.label(text="faces at min %.0f%%   at max %.0f%%" % (100 * at_min, 100 * at_max),
+                          icon='ERROR' if capped else 'NONE')
+            elif capped:
+                box.label(text="At least one selected object is capped by Max Strokes per Face.",
+                          icon='ERROR')
             if capped:
                 box.label(text="Most faces are capped -- density has little effect.")
                 box.label(text="Raise Max Strokes per Face.")
