@@ -343,10 +343,16 @@ The trigger is 8K maps or ~100,000 strokes.
 
 ---
 
-# Part 3 — The GPU preview
+# Part 3 — The GPU search: preview and bake
 
-The same search, run as a fragment shader so parameter changes are interactive. It produces
-no map at all:
+The same search, run on the GPU. One GLSL function, `find_stroke(p, n)` in `shaders.py`,
+does it: cell lookup → candidate loop → sphere, box, brush-mask and crease tests → winner.
+Two shaders include that text verbatim: the preview's fragment shader and the bake's compute
+shader. The artist therefore judges the same code that ships.
+
+## 3.1 Preview
+
+A fragment shader, so parameter changes are interactive. It produces no map at all:
 
 ```
 fragment → object-space position + normal (varyings; no baked maps needed)
@@ -374,8 +380,72 @@ strokes, which a slider drag would pay on every tick. The repeat/offset expansio
 each stroke's cell span, `repeat` the stroke index by its cell count, then recover each
 cell's `(x,y,z)` from the offset within its run — is 34× faster and produces identical grids.
 
-This is a **second implementation** of the placement rules and will never be bit-identical
-to `resolve_uv`, which remains the only thing that produces shipped maps; a disagreement is
-a preview bug. A GPU *bake* was prototyped at ~0.5 s against 3.3 s and dropped — it made
-shipped output depend on the graphics driver, and none of the exactness proofs above apply
-to a shader.
+## 3.2 Bake (the default)
+
+The bake is not drawing anything; it maps arrays to arrays. So it is a **compute shader**:
+read buffers in, one write buffer out, one thread per texel. It needs no rasterization of
+its own, because the CPU path already has everything a texel needs: its 3D position and
+normal from the cached Cycles maps, plus the `valid` mask. `gpu_resolve.resolve` takes
+exactly `resolve_uv`'s inputs and returns exactly its 4-tuple. The position bake, cache,
+gutter, dilation, EXR writing and material build are therefore shared, unchanged.
+
+```
+once per object   stroke rows, cell table, list, brush atlas   (upload_strokes, as preview)
+per chunk         ≤ 4096×1024 valid texels: position + normal → two RGBA32F textures
+                  output R32F texture prefilled with −2
+dispatch          each thread: find_stroke → imageStore(winner index, or −1)
+read back         any −2 left ⇒ the dispatch did not run ⇒ raise
+gather (numpy)    uv = seed_uv[i], lum = hash01(seed_id[i]), nrm = normalize(seed_nrm[i])
+```
+
+**The shader returns only the winner's index.** Everything a winner writes is a function of
+the stroke alone, so numpy gathers it with `resolve_uv`'s own definitions. The two resolvers
+can then disagree only about *which* stroke wins a texel, never about what it writes.
+`test_gpu_resolve` proves the gather rebuilds `resolve_uv`'s output byte for byte from its
+winners. All brush-mask sampling still happens on the GPU: the brush shape is encoded in
+which texels receive index `j`.
+
+**The CPU and GPU run the same algorithm in a different loop order.** Numpy has a fixed
+per-call cost, so the CPU runs stroke-major over Morton tiles (Part 2). The GPU already runs
+one thread per texel, so it runs texel-major with a per-cell gather. The same tests are
+applied to the same candidates.
+
+**Aligned with the CPU wherever it is cheap:**
+- *Brush mask.* It is sampled with a hand-rolled bilinear over `texelFetch`, using
+  `sample_mask`'s pixel-centre convention, from a full-resolution atlas. This replaces
+  hardware filtering: compute shaders have no screen derivatives, and the Python API
+  exposes no filter-mode setter.
+- *Tie-break.* An exact radius tie goes to the higher index, as in `resolve_uv`. The preview
+  gets this too, because the function is shared.
+
+**Measured** on the same cached maps at 1K, winner index per texel:
+
+| object | same winner | CPU resolve | GPU resolve |
+|---|---|---|---|
+| Body | 803,563 / 803,564 | 3.71 s | 0.086 s |
+| Suzanne | 814,101 / 814,102 | — | — |
+| bunny, Cube | all | — | — |
+
+Through the real operator on a two-object batch (Body + Suzanne), a whole bake took 1.9 s
+on the GPU against 9.0 s on the CPU. The written maps differ in 13 and 1 texels of 1,048,576.
+The remaining differences are float32 against float64 at a brush silhouette or crease
+threshold. That is fine for a visual output, and the result can vary slightly between
+graphics drivers.
+
+**Limits.** No texture is wider than 4096 or taller than 1024. Metal caps textures at 16384
+and treats exceeding it as a hard process abort, not a catchable error. Python's API has no
+storage buffers, so every array is a texture used as a 2D array, element `i` at
+`(i % 4096, i / 4096)`. When reading back, `np.array(Buffer)` walks a 2D buffer in the wrong
+axis order. The readback therefore flattens the buffer and uses `np.frombuffer`.
+
+## 3.3 CPU fallback
+
+`resolve_uv`, the numpy resolver of Part 2, is the fallback. It runs:
+- when the artist picks **CPU**;
+- when there is no GPU context (`--background`);
+- when the GPU path raises anywhere: shader compile, dispatch, or a readback that fails the
+  sentinel/range checks.
+
+On failure the job restarts on the CPU from scratch and the rest of the batch stays on the
+CPU, with one warning. The report names the device each job used. The CPU time model
+(`est_scale`) learns only from CPU jobs.

@@ -96,6 +96,15 @@ class AutoStrokeSettings(bpy.types.PropertyGroup):
         name="Resolution", default='2048',
         items=[('1024', "1024", ""), ('2048', "2048", ""),
                ('4096', "4096", ""), ('8192', "8192", "")])
+    bake_device: EnumProperty(
+        name="Bake With", default='GPU',
+        items=[('GPU', "GPU", "Resolve strokes on the GPU with the live preview's own "
+                              "search, so the bake matches what the viewport shows. Falls "
+                              "back to the CPU by itself if the GPU fails or Blender runs "
+                              "headless"),
+               ('CPU', "CPU", "Resolve strokes in numpy on the CPU. Slower; use it if the "
+                              "GPU bake misbehaves on this machine")],
+        description="Which processor resolves the strokes into the texture")
     force_position_bake: BoolProperty(
         name="Force Re-bake Position & Normal Map", default=False,
         description="Both maps are cached against the evaluated mesh: its vertex "

@@ -85,6 +85,28 @@ def swapped_material(obj, mat):
 
 
 @contextmanager
+def preserved_selection(view_layer):
+    """Put the artist's selection and active object back, however the bake exits.
+
+    Cycles bakes the SELECTED object, so bake() deselects everything and selects the one
+    object it is baking. Left unrestored, a multi-object bake collapsed the artist's
+    selection to whichever object baked last -- and pressing Bake again then silently
+    baked that one object instead of the group they had selected.
+    """
+    selected = [o for o in view_layer.objects if o.select_get()]
+    active = view_layer.objects.active
+    try:
+        yield
+    finally:
+        for o in view_layer.objects:
+            if o.select_get():
+                o.select_set(False)
+        for o in selected:
+            o.select_set(True)
+        view_layer.objects.active = active
+
+
+@contextmanager
 def selectable(obj):
     """Guarantee obj can be selected for the bake, whatever its Outliner state.
 
@@ -223,8 +245,10 @@ def bake(obj, res, margin=16, channel="position"):
     tex.image = img
     mat.node_tree.nodes.active = tex
 
-    with preserved_bake_settings(scene), disabled_geometry_nodes(obj), \
-            swapped_material(obj, mat), selectable(obj):
+    # preserved_selection is outermost so it restores LAST, after selectable() has put
+    # the object's own hide/lock state back.
+    with preserved_selection(bpy.context.view_layer), preserved_bake_settings(scene), \
+            disabled_geometry_nodes(obj), swapped_material(obj, mat), selectable(obj):
         scene.render.engine = 'CYCLES'
         if hasattr(scene, "cycles"):
             scene.cycles.device = 'CPU'

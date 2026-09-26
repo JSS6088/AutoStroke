@@ -32,6 +32,7 @@ import bpy
 from .bridge import cache as seed_cache, mesh as mesh_bridge, seeds as seed_bridge
 from .core import baker, geometry
 from .core.config import INV_SQRT2
+from .shaders import SEARCH, STROKE_ROWS, STROKE_TILE_W
 
 _handle = None          # the draw-handler token, or None when the preview is off
 _state = None           # everything the handler needs; rebuilt when settings change
@@ -76,101 +77,34 @@ void main()
 }
 """
 
-STROKE_TILE_W = 4096
-"""Fixed width for the stroke texture, same reasoning and same value as list_tex/cell_tex
-below: MTLTextureDescriptor on Apple GPUs (and plenty of others) caps a 2D texture at
-16384 texels wide. stroke_tex used to be exactly (stroke count, 4) -- width equal to the
-RAW stroke count -- so any preview past 16384 strokes (well inside PREVIEW_BUDGET's
-60,000) hit that cap and crashed the whole process: a native Metal assertion failure, not
-a Python exception, so nothing in this addon could have caught or reported it. Tiling into
-a fixed-width grid, the same way list_tex already had to be, removes the ceiling instead
-of trying to guess a safe one. Hardcoded into the GLSL below (STROKE_TILE_W token,
-substituted after this string) rather than passed as a uniform -- the push-constant
-budget is already exactly 128 bytes with nothing spare, and a width we choose ourselves
-needs no uniform slot at all."""
-
-FRAG = """
-vec4 stroke_row(int i, int row)
-{
-    ivec2 tc = ivec2(i % STROKE_TILE_W, (i / STROKE_TILE_W) * 4 + row);
-    return texelFetch(u_stroke, tc, 0);
-}
-
+# The stroke search itself lives in shaders.py, shared verbatim with the GPU bake: the
+# preview is required to show what the bake will produce, and one copy of a rule cannot
+# drift from itself. Only what is specific to DRAWING stays here -- the occupancy debug
+# view and the headlight shading of the winner.
+FRAG = SEARCH + """
 void main()
 {
     vec3 n = normalize(v_nrm);
-    ivec3 gdim = u_dim_n.xyz;
-    int   nstroke = u_dim_n.w;
-    int   list_w = u_misc.x;
-    int   cell_w = u_misc.y;
-    int   cols = u_misc.z;
-    int   mode = u_misc.w;
-    float cos_cut = u_grid_lo.w;
-
-    ivec3 c = ivec3(floor((v_pos - u_grid_lo.xyz) * u_grid_inv.xyz));
-    c = clamp(c, ivec3(0), gdim - 1);
-    int cell = c.x + gdim.x * (c.y + gdim.y * c.z);
-    vec2 sc = texelFetch(u_cell, ivec2(cell % cell_w, cell / cell_w), 0).rg;
-    int start = int(sc.x);
-    int count = int(sc.y);
+    int mode = u_misc.w;
 
     if (mode == 2) {                        /* occupancy, for debugging the binning */
-        float f = clamp(float(count) / 64.0, 0.0, 1.0);
+        float f = clamp(float(cell_range(v_pos).y) / 64.0, 0.0, 1.0);
         fragColor = vec4(f, 1.0 - f, 0.0, 1.0);
         return;
     }
 
-    float best_r = 1e30;
-    vec3  best_n = vec3(0.0);
-    float best_l = 0.5;
-    bool  found  = false;
-
-    for (int k = 0; k < count; ++k) {
-        int li = start + k;
-        int i = int(texelFetch(u_list, ivec2(li % list_w, li / list_w), 0).r);
-        if (i < 0 || i >= nstroke) continue;
-
-        vec4 r0 = stroke_row(i, 0);          /* pos.xyz, r_eff */
-        float r = r0.w;
-        if (r >= best_r) continue;           /* cannot win: skip the rest */
-
-        vec3 d = v_pos - r0.xyz;
-        if (dot(d, d) >= r * r) continue;    /* sphere */
-
-        vec4 r1 = stroke_row(i, 1);          /* T.xyz, luminance */
-        vec4 r2 = stroke_row(i, 2);          /* normal.xyz, brush index */
-        vec4 r3 = stroke_row(i, 3);          /* lu_lo, lu_hi, lv_lo, lv_hi */
-        vec3 T = r1.xyz;
-        vec3 SN = r2.xyz;
-        vec3 B = cross(SN, T);
-        float lu = dot(d, T);
-        float lv = dot(d, B);
-        if (lu <= r3.x || lu >= r3.y || lv <= r3.z || lv >= r3.w) continue;
-
-        float two_h = 2.0 * r * 0.7071067811865476;   /* 1/sqrt(2) */
-        vec2 uv = vec2(lu / two_h + 0.5, lv / two_h + 0.5);
-        int bi = int(r2.w);
-        vec2 tile = vec2(float(bi % cols), float(bi / cols));
-        vec2 auv = (tile + vec2(uv.x, 1.0 - uv.y)) / float(cols);
-        if (texture(u_brush, auv).r <= 0.5) continue;
-
-        if (dot(n, SN) <= cos_cut) continue;          /* crease guard */
-
-        best_r = r; best_n = SN; best_l = r1.w; found = true;
-    }
-
-    vec3 shade_n = found ? normalize(best_n) : n;
+    int w = find_stroke(v_pos, v_nrm);
+    bool found = w >= 0;
+    vec3 shade_n = found ? normalize(stroke_row(w, 2).xyz) : n;
     if (mode == 1) {
         fragColor = vec4(shade_n * 0.5 + 0.5, 1.0);
         return;
     }
     float lit = clamp(dot(shade_n, vec3(0.0, 0.0, 1.0)) * 0.5 + 0.5, 0.0, 1.0);
-    float tone = found ? mix(0.85, 1.0, best_l) : 1.0;
+    float tone = found ? mix(0.85, 1.0, stroke_row(w, 1).w) : 1.0;
     fragColor = vec4(vec3(lit * tone), 1.0);
 }
 """
-
-FRAG = FRAG.replace("STROKE_TILE_W", str(STROKE_TILE_W))
 
 
 def make_shader():
@@ -305,11 +239,15 @@ def build_grid(pos, r, T, nrm, bb_local, max_dim=48):
             counts.astype(np.float32), pairs[:, 1].astype(np.float32))
 
 
-def pack_brush_atlas(masks):
-    """The brush set as one square atlas, cols x cols tiles. One texture, one sampler."""
+def pack_brush_atlas(masks, max_tile=512):
+    """The brush set as one square atlas, cols x cols tiles. One texture, one sampler.
+
+    `max_tile` caps each brush's tile: 512 is plenty for the preview's silhouette, while
+    the GPU bake passes the full brush resolution so its mask test samples the same
+    pixels the CPU bake does."""
     cols = int(np.ceil(np.sqrt(len(masks))))
     tile = max(m.shape[0] for m in masks)
-    tile = min(tile, 512)                     # the silhouette is all the preview needs
+    tile = min(tile, max_tile)
     atlas = np.zeros((cols * tile, cols * tile), np.float32)
     for i, m in enumerate(masks):
         if m.shape[0] != tile:
@@ -351,11 +289,11 @@ def stroke_tile_buffer(packed, width=STROKE_TILE_W):
     """
     n = max(len(packed), 1)
     tile_h = int(np.ceil(n / float(width)))
-    out = np.zeros((4 * tile_h, width, 4), np.float32)
+    out = np.zeros((STROKE_ROWS * tile_h, width, 4), np.float32)
     n_real = len(packed)
     col = np.arange(n_real) % width
-    base_row = (np.arange(n_real) // width) * 4
-    for r in range(4):
+    base_row = (np.arange(n_real) // width) * STROKE_ROWS
+    for r in range(STROKE_ROWS):
         out[base_row + r, col] = packed[:, r]
     return out
 
@@ -379,9 +317,56 @@ def _pack_stroke_texture(packed, width=STROKE_TILE_W):
     return tex
 
 
+def upload_strokes(masks, cfg, seeds, tan, max_dim=48, atlas_tile=512):
+    """The four read-only tables the stroke search reads, uploaded to the GPU.
+
+    Shared by the live preview and the GPU bake so both search IDENTICAL data: the stroke
+    table (STROKE_ROWS RGBA rows per stroke), the grid's per-cell (start, count), the flat
+    list of stroke indices grouped by cell, and the brush atlas. Every one of them is a
+    fixed-width grid (see shaders.STROKE_TILE_W) so no dimension grows with the stroke
+    count past what Metal accepts.
+
+    `max_dim` caps grid cells per axis; `atlas_tile` caps each brush's atlas tile. The
+    preview keeps both small (it re-uploads on every slider tick); the bake raises them
+    for shorter per-cell loops and full-resolution brushes.
+    """
+    import gpu
+    packed, pos, r, T, nrm = pack_strokes(seeds, tan, masks, cfg)
+    bbl = packed[:, 3, :].astype(np.float64)
+    gmin, ginv, dim, starts, counts, lst = build_grid(pos, r, T, nrm, bbl, max_dim=max_dim)
+
+    stroke_tex = _pack_stroke_texture(packed)
+    cell_w = 4096
+    cell_h = int(np.ceil(len(counts) / float(cell_w)))
+    cbuf = np.zeros((cell_w * cell_h, 2), np.float32)
+    cbuf[:len(counts), 0] = starts
+    cbuf[:len(counts), 1] = counts
+    cell_tex = gpu.types.GPUTexture(
+        (cell_w, cell_h), format='RG32F',
+        data=gpu.types.Buffer('FLOAT', cell_w * cell_h * 2, cbuf.ravel()))
+    list_tex, list_w = _flat_texture(lst)
+
+    atlas, cols = pack_brush_atlas(masks, max_tile=atlas_tile)
+    brush_tex = gpu.types.GPUTexture(
+        atlas.shape, format='R32F',
+        data=gpu.types.Buffer('FLOAT', atlas.size, np.ascontiguousarray(atlas).ravel()))
+
+    return dict(stroke=stroke_tex, cell=cell_tex, lst=list_tex, brush=brush_tex,
+                grid_lo=gmin, grid_inv=ginv, grid_dim=dim, n=len(pos),
+                cell_w=cell_w, list_w=list_w, cols=cols)
+
+
+def bind_stroke_tables(shader, up):
+    """Bind upload_strokes()'s tables to a shader that includes shaders.SEARCH. Uniforms
+    that differ per caller (cos_cut, the .w slots) are set by the caller afterwards."""
+    shader.uniform_sampler("u_stroke", up["stroke"])
+    shader.uniform_sampler("u_cell", up["cell"])
+    shader.uniform_sampler("u_list", up["lst"])
+    shader.uniform_sampler("u_brush", up["brush"])
+
+
 def _build(context, obj):
     """Everything the shader needs, from the same seeds the bake would use."""
-    import gpu
     from .ops.bake import config_from_settings, load_brush, mesh_signature
 
     st = context.scene.autostroke
@@ -407,26 +392,7 @@ def _build(context, obj):
                 seeds["position"].astype(np.float32), seeds["normal"].astype(np.float32), cfg)
         seed_cache.put(ckey, seeds, stats, tan, curv)
 
-    packed, pos, r, T, nrm = pack_strokes(seeds, tan, masks, cfg)
-    bbl = packed[:, 3, :].astype(np.float64)
-    gmin, ginv, dim, starts, counts, lst = build_grid(pos, r, T, nrm, bbl)
-
-    n = len(pos)
-    stroke_tex = _pack_stroke_texture(packed)
-    cell_w = 4096
-    cell_h = int(np.ceil(len(counts) / float(cell_w)))
-    cbuf = np.zeros((cell_w * cell_h, 2), np.float32)
-    cbuf[:len(counts), 0] = starts
-    cbuf[:len(counts), 1] = counts
-    cell_tex = gpu.types.GPUTexture(
-        (cell_w, cell_h), format='RG32F',
-        data=gpu.types.Buffer('FLOAT', cell_w * cell_h * 2, cbuf.ravel()))
-    list_tex, list_w = _flat_texture(lst)
-
-    atlas, cols = pack_brush_atlas(masks)
-    brush_tex = gpu.types.GPUTexture(
-        atlas.shape, format='R32F',
-        data=gpu.types.Buffer('FLOAT', atlas.size, np.ascontiguousarray(atlas).ravel()))
+    up = upload_strokes(masks, cfg, seeds, tan)
 
     me = obj.evaluated_get(context.evaluated_depsgraph_get()).to_mesh()
     try:
@@ -470,10 +436,7 @@ def _build(context, obj):
     diag = float(np.linalg.norm(vpos.max(0) - vpos.min(0)))
     depth_offset = max(diag, 1e-6) * 0.001
 
-    return dict(shader=shader, batch=batch, obj=obj, n=n, depth_offset=depth_offset,
-                stroke=stroke_tex, cell=cell_tex, lst=list_tex, brush=brush_tex,
-                grid_lo=gmin, grid_inv=ginv, grid_dim=dim,
-                cell_w=cell_w, list_w=list_w, cols=cols)
+    return dict(up, shader=shader, batch=batch, obj=obj, depth_offset=depth_offset)
 
 
 def _draw():
@@ -494,10 +457,7 @@ def _draw():
         gpu.state.face_culling_set('BACK')
         sh.bind()
         sh.uniform_float("u_mvp", mvp)
-        sh.uniform_sampler("u_stroke", s["stroke"])
-        sh.uniform_sampler("u_cell", s["cell"])
-        sh.uniform_sampler("u_list", s["lst"])
-        sh.uniform_sampler("u_brush", s["brush"])
+        bind_stroke_tables(sh, s)
         # packed to stay inside the 128-byte push-constant budget; see make_shader()
         lo = s["grid_lo"]
         inv = s["grid_inv"]

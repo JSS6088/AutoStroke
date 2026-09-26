@@ -164,6 +164,7 @@ def main():
     partial_failure_tests(bake_mod)
     per_job_timing(bake_mod)
     report_batch_tests(bake_mod)
+    device_tests(bake_mod)
 
     print("\n%s\n" % ("ALL PASS" if not FAILED else "FAILED: " + ", ".join(FAILED)))
     return 1 if FAILED else 0
@@ -427,6 +428,17 @@ def per_job_timing(bake_mod):
         op._write(ctx, job2)
         check("second job with t0=now-1s reports ~1s, unaffected by batch age or job1",
               0.5 < job2.secs < 1.5, job2.secs)
+
+        print("\nEST_SCALE LEARNS ONLY FROM CPU JOBS (it models numpy time)")
+        ctx.scene.autostroke.est_scale = 1.0
+        job2.device, job2.t0 = 'GPU', time.time() - 0.05
+        op._write(ctx, job2)
+        check("a GPU job leaves the CPU cost calibration alone",
+              ctx.scene.autostroke.est_scale == 1.0, ctx.scene.autostroke.est_scale)
+        job2.device, job2.t0 = 'CPU', time.time() - 1.0
+        op._write(ctx, job2)
+        check("a CPU job still calibrates it", ctx.scene.autostroke.est_scale != 1.0,
+              ctx.scene.autostroke.est_scale)
     finally:
         bi.write_map = orig_write_map
         material_ops.build = orig_build
@@ -487,6 +499,118 @@ def report_batch_tests(bake_mod):
           lines)
     check("the failure is named with its reason", any(l == "failed: Plane — no UV map"
                                                        for l in lines), lines)
+
+
+def drain(gen):
+    try:
+        while True:
+            next(gen)
+    except StopIteration as stop:
+        return stop.value
+
+
+def device_tests(bake_mod):
+    import contextlib
+    import io
+    print("\nDEVICE CHOICE")
+    check("GPU requested, windowed -> GPU", bake_mod.pick_device('GPU', False) == ('GPU', ""))
+    check("CPU requested -> CPU", bake_mod.pick_device('CPU', False)[0] == 'CPU')
+    d, why = bake_mod.pick_device('GPU', True)
+    check("GPU requested but headless -> CPU, and says why", d == 'CPU' and "headless" in why,
+          why)
+
+    print("\nA FAILING GPU FINISHES THE SAME JOB ON THE CPU -- AND THE REST OF THE BATCH")
+    err = bake_mod.gpu_resolve.GPUResolveError
+
+    def gpu_ok():
+        yield 0.5
+        return "gpu-result"
+
+    def cpu_ok():
+        yield 0.5
+        return "cpu-result"
+
+    def gpu_bad():
+        yield 0.3                           # fails AFTER making progress, the harder case
+        raise err("12 texels were never written by the GPU")
+
+    op = bake_mod.AUTOSTROKE_OT_bake()
+    op.device, op.device_note = 'GPU', ""
+    warnings = []
+    op.report = lambda level, msg: warnings.append(msg) if level == {'WARNING'} else None
+
+    def job(name, note):
+        j = bake_mod.Job(FakeObj(name))
+        j.device, j.pos_note = 'GPU', note
+        return j
+
+    quiet = io.StringIO()                   # the fallback prints its traceback to console
+    a = job("A", "position: baked · GPU")
+    with contextlib.redirect_stdout(quiet):
+        res = drain(op._gpu_or_cpu(a, gpu_ok, cpu_ok))
+    check("GPU success: GPU result, job stays GPU",
+          res == "gpu-result" and a.device == 'GPU' and op.device == 'GPU')
+
+    b = job("B", "position: cached · GPU")
+    with contextlib.redirect_stdout(quiet):
+        res = drain(op._gpu_or_cpu(b, gpu_bad, cpu_ok))
+    check("GPU failure mid-job: the SAME job completes with the CPU result",
+          res == "cpu-result", res)
+    check("...the job is recorded as CPU", b.device == 'CPU')
+    check("...its report names the fallback and why",
+          "CPU (GPU failed: 12 texels were never written" in b.pos_note, b.pos_note)
+    check("...the rest of the batch switches to CPU", op.device == 'CPU')
+    check("...and the artist is warned once", len(warnings) == 1, warnings)
+
+    c = job("C", "position: baked · GPU")
+    with contextlib.redirect_stdout(quiet):
+        drain(op._gpu_or_cpu(c, gpu_bad, cpu_ok))
+    check("a second failure in the same batch does not warn again", len(warnings) == 1)
+
+    print("\nFALLBACK INSIDE THE REAL MODAL LOOP: SEQUENCING UNCHANGED")
+    objs = [FakeObj(n) for n in ("A", "B", "C")]
+    op2 = bake_mod.AUTOSTROKE_OT_bake()
+    op2.jobs = [bake_mod.Job(o) for o in objs]
+    op2.i = 0
+    op2.stages = bake_mod.Stages()
+    op2.done, op2.failed = [], []
+    op2._batch_t0 = time.time()
+    op2._timer = object()
+    op2.workdir, op2.mask, op2.brush_set, op2.cfg = "/tmp", [None], "standard", None
+    op2.device, op2.device_note = 'GPU', ""
+    op2.report = lambda level, msg: None
+    order, used = [], []
+
+    def start(context, j):
+        order.append("start(%s)" % j.obj.name)
+        j.t0 = time.time()
+        j.pos_note = "position: baked"
+        if op2.device == 'GPU':
+            gpu = gpu_bad if j.obj.name == "B" else gpu_ok
+            j.device = 'GPU'
+            j.pos_note += " · GPU"
+            j.gen = op2._gpu_or_cpu(j, gpu, cpu_ok)
+        else:
+            j.device = 'CPU'
+            j.gen = cpu_ok()
+        return True
+
+    def write(context, j):
+        order.append("write(%s)" % j.obj.name)
+        used.append((j.obj.name, j.device))
+        j.secs, j.coverage = 0.0, 100.0
+        j.sstats = {"strokes": 1, "radius_med": 0.1, "at_min": 0.0, "at_max": 0.0}
+
+    op2._start_job, op2._write = start, write
+    op2._start_job(FakeContext(), op2.jobs[0])
+    with contextlib.redirect_stdout(quiet):
+        result = _drive_to_completion(op2, FakeContext())
+    check("batch finishes", result == {'FINISHED'}, result)
+    check("strict start/write alternation still holds",
+          order == ["start(A)", "write(A)", "start(B)", "write(B)", "start(C)", "write(C)"],
+          order)
+    check("A on GPU, B fell back mid-job, C started on CPU",
+          used == [("A", 'GPU'), ("B", 'CPU'), ("C", 'CPU')], used)
 
 
 if __name__ == "__main__":

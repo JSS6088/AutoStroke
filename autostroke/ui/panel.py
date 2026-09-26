@@ -146,11 +146,15 @@ class AUTOSTROKE_PT_main(bpy.types.Panel):
             strokes, secs, at_min, at_max = _estimate(context, objs[0])
         else:
             strokes, secs, at_min, at_max = _estimate_batch(context, objs)
-        label = ("~ %s strokes  ·  bake ~ %s" % ("{:,}".format(strokes), _fmt_time(secs))
+        # The time model is fitted to the CPU resolver; a GPU bake is dominated by the
+        # (cached) Cycles position bake instead, so quoting a CPU time there would be wrong.
+        on_gpu = st.bake_device == 'GPU'
+        when = "bake on GPU" if on_gpu else "bake ~ %s" % _fmt_time(secs)
+        label = ("~ %s strokes  ·  %s" % ("{:,}".format(strokes), when)
                  if len(objs) == 1 else
-                 "~ %s strokes total  ·  bake ~ %s total across %d objects"
-                 % ("{:,}".format(strokes), _fmt_time(secs), len(objs)))
-        box.label(text=label, icon='INFO' if secs < 300 else 'ERROR')
+                 "~ %s strokes total  ·  %s across %d objects"
+                 % ("{:,}".format(strokes), when, len(objs)))
+        box.label(text=label, icon='INFO' if on_gpu or secs < 300 else 'ERROR')
         if strokes:
             capped = at_max > 0.5
             if len(objs) == 1:
@@ -186,6 +190,8 @@ class AUTOSTROKE_PT_main(bpy.types.Panel):
         box.label(text="Output")
         box.prop(st, "working_dir")
         box.prop(st, "resolution")
+        row = box.row(align=True)
+        row.prop(st, "bake_device", expand=True)
         box.prop(st, "force_position_bake")
 
         box = layout.box()

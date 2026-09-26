@@ -37,14 +37,14 @@ def _load_pure():
     if len(keep) != len(want):
         raise SystemExit("livepreview.py no longer defines %s"
                          % sorted(want - {n.name for n in keep}))
-    # STROKE_TILE_W is stroke_tile_buffer's default arg value, evaluated when the
-    # function def below executes -- it has to exist in ns first.
-    const = [n for n in tree.body if isinstance(n, ast.Assign)
-             and isinstance(n.targets[0], ast.Name) and n.targets[0].id == "STROKE_TILE_W"]
-    if not const:
-        raise SystemExit("livepreview.py no longer defines STROKE_TILE_W")
-    ns = {"np": np, "baker": baker, "geometry": geometry, "INV_SQRT2": INV_SQRT2}
-    exec(compile(ast.Module(body=const + keep, type_ignores=[]), "<livepreview>", "exec"), ns)
+    # The stroke-table layout constants live in shaders.py (shared with the GPU bake);
+    # STROKE_TILE_W is stroke_tile_buffer's default argument, evaluated when the function
+    # def below executes, so both have to be in ns first. shaders.py is plain strings and
+    # ints, so it imports without bpy.
+    import shaders
+    ns = {"np": np, "baker": baker, "geometry": geometry, "INV_SQRT2": INV_SQRT2,
+          "STROKE_TILE_W": shaders.STROKE_TILE_W, "STROKE_ROWS": shaders.STROKE_ROWS}
+    exec(compile(ast.Module(body=keep, type_ignores=[]), "<livepreview>", "exec"), ns)
     return types.SimpleNamespace(**{k: ns[k] for k in want | {"STROKE_TILE_W"}})
 
 
@@ -176,6 +176,7 @@ def main():
     debounce()
     shading_normals()
     stroke_texture_width()
+    shared_search()
 
     print("\n%s\n" % ("ALL PASS" if not FAILED else "FAILED: " + ", ".join(FAILED)))
     return 1 if FAILED else 0
@@ -349,6 +350,45 @@ def shading_normals():
           "old %.3f vs new %.3f, cutoff %.3f" % (smoothed @ nA, vnrm[2] @ nA, cut))
     check("and still rejects on the far face", float(vnrm[3] @ nA) <= cut,
           "%.3f" % (vnrm[3] @ nA))
+
+
+def shared_search():
+    """The preview draws with the SAME search the GPU bake runs -- one GLSL source.
+
+    The bake resolves texels with shaders.SEARCH in a compute shader; the preview must show
+    what that produces, so its fragment shader has to include the identical text rather
+    than its own copy. FRAG is lifted from the shipping source and evaluated against the
+    real shaders module, so a preview that grew its own loop again fails here.
+    """
+    import shaders
+    print("\nTHE PREVIEW RUNS THE SAME SEARCH AS THE GPU BAKE")
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "livepreview.py")
+    tree = ast.parse(open(path).read())
+    frag = [n for n in tree.body if isinstance(n, ast.Assign)
+            and isinstance(n.targets[0], ast.Name) and n.targets[0].id == "FRAG"]
+    check("livepreview defines FRAG exactly once", len(frag) == 1, "%d" % len(frag))
+    if len(frag) != 1:
+        return
+    ns = {"SEARCH": shaders.SEARCH}
+    exec(compile(ast.Module(body=frag, type_ignores=[]), "<livepreview>", "exec"), ns)
+    FRAG = ns["FRAG"]
+    check("FRAG starts with shaders.SEARCH, verbatim", FRAG.startswith(shaders.SEARCH))
+    check("...and its main() only calls the search, it has no loop of its own",
+          "find_stroke(v_pos, v_nrm)" in FRAG
+          and FRAG[len(shaders.SEARCH):].count("for (") == 0)
+
+    print("\nBRUSH ATLAS KEEPS FULL RESOLUTION WHEN THE BAKE ASKS FOR IT")
+    big = [np.random.default_rng(k).random((1024, 1024)).astype(np.float32) for k in range(3)]
+    atlas, cols = LP.pack_brush_atlas(big, max_tile=1024)
+    tile = atlas.shape[0] // cols
+    check("max_tile=1024: tiles are 1024, not the preview's 512", tile == 1024, "%d" % tile)
+    check("...and each tile is the brush itself, pixel for pixel",
+          all(np.array_equal(atlas[(i // cols) * tile:(i // cols + 1) * tile,
+                                   (i % cols) * tile:(i % cols + 1) * tile], m)
+              for i, m in enumerate(big)))
+    small, _ = LP.pack_brush_atlas(big)
+    check("the default is still the preview's 512", small.shape[0] // cols == 512)
 
 
 if __name__ == "__main__":

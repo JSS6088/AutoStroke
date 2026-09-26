@@ -90,6 +90,9 @@ class FakeActiveSlot:
         return self._obj
 
     def set(self, obj):
+        if obj is None:               # real bpy accepts None: it clears the active object
+            self._obj = None
+            return
         if not obj.in_view_layer:
             return                    # matches Object.select_set()'s own silence
         self._obj = obj
@@ -119,6 +122,10 @@ def configure(bpy_mod, bake_should_fail=None):
 
     class _Objects:
         active = _ActiveProxy()
+        members = []                 # the scene's objects, for tests that populate it
+
+        def __iter__(self):
+            return iter(type(self).members)
 
     class _ViewLayer:
         objects = _Objects()
@@ -262,6 +269,32 @@ def main():
         pass
     check("hide_select restored after an exception", obj3.hide_select is True)
     check("hidden restored after an exception", obj3.hide_get() is True)
+
+    print("\nBAKE() PUTS THE ARTIST'S SELECTION BACK")
+    # Cycles bakes the SELECTED object, so bake() selects only the object it bakes. It
+    # used to leave it that way: after a multi-object bake the selection had collapsed to
+    # the last object baked, and the next Bake silently processed just that one.
+    configure(bpy_mod)
+    vl_objects = bpy_mod.context.view_layer.objects
+    keep_a, keep_b, baked = FakeObj(name="KeepA"), FakeObj(name="KeepB"), FakeObj(name="Baked")
+    type(vl_objects).members = [keep_a, keep_b, baked]
+    keep_a.select_set(True)
+    keep_b.select_set(True)
+    vl_objects.active = keep_a
+    try:
+        position.bake(baked, 64, channel="position")
+        ok_bake = True
+    except Exception as e:
+        ok_bake = False
+        print("      bake raised: %s" % e)
+    check("bake() completes", ok_bake)
+    check("the artist's selection is exactly what it was",
+          keep_a.select_get() and keep_b.select_get() and not baked.select_get(),
+          "KeepA=%s KeepB=%s Baked=%s" % (keep_a.select_get(), keep_b.select_get(),
+                                          baked.select_get()))
+    check("...and so is the active object", vl_objects.active is keep_a,
+          getattr(vl_objects.active, "name", None))
+    type(vl_objects).members = []
 
     print("\nBAKE() TURNS OFF SELECTED-TO-ACTIVE, RESTORES IT AFTER")
     # Cycles' "Selected to Active" bakes FROM every other selected object ONTO the

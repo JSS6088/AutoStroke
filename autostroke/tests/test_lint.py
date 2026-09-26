@@ -26,7 +26,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # pyflakes parses the annotation as a forward reference and reports the subtype and enum
 # strings as undefined names. Listed individually on purpose: a blanket filter is what
 # hid the real one.
-PYFLAKES_OK = {"ANGLE", "DIR_PATH", "PERCENTAGE", "Resolution", "Shaded"}
+PYFLAKES_OK = {"ANGLE", "DIR_PATH", "PERCENTAGE", "Resolution", "Shaded",
+               "GPU", "CPU"}   # the bake_device enum identifiers
 
 # keywords in a bpy.props call that take a module-level callable
 CALLBACK_KW = ("update", "items", "get", "set", "poll")

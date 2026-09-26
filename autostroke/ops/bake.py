@@ -3,6 +3,7 @@
 import os
 import re
 import time
+import traceback
 from contextlib import contextmanager
 
 import numpy as np
@@ -14,6 +15,7 @@ from ..bridge import brushes as brush_bridge, cache as seed_cache
 from ..bridge import images as bi, mesh as mesh_bridge
 from ..bridge import position as pos_bridge
 from ..bridge import seeds as seed_bridge
+from .. import gpu_resolve
 from . import setup as setup_ops
 
 SIG_KEY = "autostroke_position_sig"
@@ -122,6 +124,21 @@ def mesh_signature(obj):
     return mesh_bridge.signature(obj)
 
 
+def pick_device(requested, background):
+    """('GPU' | 'CPU', why) for a batch.
+
+    GPU is the default: it runs the live preview's own stroke search (shaders.SEARCH), so
+    the bake is what the viewport showed. CPU when the artist asks for it, or when Blender
+    runs headless -- `blender --background` has no GPU context to dispatch on at all. A GPU
+    that fails at bake time is handled separately, per job (see _gpu_or_cpu).
+    """
+    if requested == 'CPU':
+        return 'CPU', ""
+    if background:
+        return 'CPU', "headless: no GPU context"
+    return 'GPU', ""
+
+
 def targets(context):
     """Objects this bake will process, in a stable order.
 
@@ -178,6 +195,7 @@ class Job:
         self.gen = None
         self.result = None
         self.error = None          # set on failure; the job is skipped, not fatal
+        self.device = 'CPU'        # resolver that actually produced this job's maps
         self.secs = None           # set by _write(): this job's own elapsed time
         self.coverage = None       # set by _write(): percent of valid texels covered
 
@@ -215,6 +233,8 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
         except RuntimeError as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
+        self.device, self.device_note = pick_device(
+            getattr(st, "bake_device", 'GPU'), bpy.app.background)
 
         self.jobs = [Job(o) for o in objs]
         self.i = 0
@@ -342,18 +362,66 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
             # fallback, and in the same object space as the seed normals.
             flat_n = job.surf_nrm.reshape(-1, 3)
 
-            job.gen = baker.resolve_uv(
-                flat[job.valid], job.uv_self[job.valid],
-                seeds["position"].astype(np.float32), seeds["id"].astype(np.int64),
-                seeds["UVMap"].astype(np.float32), seed_r,
-                seeds["normal"].astype(np.float32),
-                None, self.mask, self.cfg, seed_tan, stamp_rot,
-                pt_nrm=flat_n[job.valid])
+            pts, uvs, pns = flat[job.valid], job.uv_self[job.valid], flat_n[job.valid]
+
+            def cpu_gen():
+                return baker.resolve_uv(
+                    pts, uvs,
+                    seeds["position"].astype(np.float32), seeds["id"].astype(np.int64),
+                    seeds["UVMap"].astype(np.float32), seed_r,
+                    seeds["normal"].astype(np.float32),
+                    None, self.mask, self.cfg, seed_tan, stamp_rot,
+                    pt_nrm=pns)
+
+            # Both resolvers take the same texels and return the same tuple, so nothing
+            # before or after this line knows which one ran -- the position maps, valid
+            # mask, _write assembly, dilation and material are shared by both.
+            if self.device == 'GPU':
+                def gpu_gen():
+                    return gpu_resolve.resolve(pts, uvs, pns, seeds, seed_tan,
+                                               self.mask, self.cfg)
+                job.device = 'GPU'
+                job.gen = self._gpu_or_cpu(job, gpu_gen, cpu_gen)
+            else:
+                job.device = 'CPU'
+                job.gen = cpu_gen()
+            job.pos_note = "%s · %s" % (job.pos_note, self._device_label(job))
             return True
         except (RuntimeError, mesh_bridge.MeshError) as e:
             context.window.cursor_set('DEFAULT')
             job.error = str(e)
             return False
+
+    def _device_label(self, job):
+        if job.device == 'GPU':
+            return "GPU"
+        return "CPU (%s)" % self.device_note[:48] if self.device_note else "CPU"
+
+    def _gpu_or_cpu(self, job, gpu_gen, cpu_gen):
+        """Run the GPU resolver; on ANY failure, finish this same job on the CPU.
+
+        A generator wrapping a generator, so modal() cannot tell the difference: it keeps
+        calling next() and gets progress either way. Failures cover shader compile,
+        dispatch, and gpu_resolve's own checks on what came back (a sentinel that
+        survived, an index out of range) -- a GPU that is silently wrong raises there
+        rather than shipping a broken map. The first failure also switches the REST of
+        the batch to CPU: retrying a broken GPU once per object would just fail N times.
+        """
+        try:
+            result = yield from gpu_gen()
+            return result
+        except Exception as e:
+            print("AutoStroke: GPU resolve failed, falling back to CPU:\n"
+                  + traceback.format_exc())
+            reason = "GPU failed: %s" % (str(e) or type(e).__name__)
+            if self.device == 'GPU':
+                self.device, self.device_note = 'CPU', reason
+                self.report({'WARNING'}, "AutoStroke: %s -- baking on the CPU instead"
+                            % reason[:160])
+            job.device = 'CPU'
+            job.pos_note = job.pos_note.replace(" · GPU", " · " + self._device_label(job))
+            result = yield from cpu_gen()
+            return result
 
     # ---- the chunked loop --------------------------------------------------
     def modal(self, context, event):
@@ -458,12 +526,15 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
         ss = job.sstats
         # Feed the real time back so the panel's estimate learns this machine and model
         # -- once per job, each against its OWN elapsed time, not the batch's.
+        # Only CPU jobs teach it: the cost model predicts numpy time, and a GPU bake's
+        # far shorter time would drag the estimate toward nonsense for the fallback.
         from ..core import cost
         st = context.scene.autostroke
-        st.est_scale = cost.calibration(
-            job.secs, cost.bake_seconds(int(st.resolution), max(ss["strokes"], 1),
-                                        st.stroke_size, scale=1.0),
-            previous=st.est_scale)
+        if job.device == 'CPU':
+            st.est_scale = cost.calibration(
+                job.secs, cost.bake_seconds(int(st.resolution), max(ss["strokes"], 1),
+                                            st.stroke_size, scale=1.0),
+                previous=st.est_scale)
         try:
             from . import material as material_ops
             with self.stages("material"):
