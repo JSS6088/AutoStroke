@@ -30,9 +30,11 @@ INTERPOLATION = {
     "stroke_indirection": 'Closest',
     # The normal map is NOT read through the indirection -- it is sampled with the
     # mesh's own UVs (see the module docstring), so nothing in it is a pointer and
-    # Closest only buys visible texel stair-stepping along every cell edge. Cubic
-    # smooths it. A map that IS read through the indirection belongs above, not here.
-    "stroke_normal": 'Cubic',
+    # Closest only buys visible texel stair-stepping along every cell edge. Linear
+    # softens each stroke edge over ~2 texels; Cubic (a B-spline in Blender) spreads it
+    # over ~4 and read as blurry next to the per-pixel live preview. A map that IS read
+    # through the indirection belongs above, not here.
+    "stroke_normal": 'Linear',
 }
 
 

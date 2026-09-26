@@ -40,8 +40,8 @@ def main():
     check("the indirection map is never filtered",
           rules.get("stroke_indirection") == "Closest",
           "-> %s" % rules.get("stroke_indirection"))
-    check("the normal map is filtered, since it is not a pointer table",
-          rules.get("stroke_normal") == "Cubic", "-> %s" % rules.get("stroke_normal"))
+    check("the normal map is filtered Linear (Cubic blurs stroke edges)",
+          rules.get("stroke_normal") == "Linear", "-> %s" % rules.get("stroke_normal"))
 
     # An unknown map must fall back to Closest: unfiltered is the safe default for a map
     # whose meaning the builder does not know.
