@@ -13,3 +13,7 @@ Output/
 
 # Claude Code's local, per-machine session config (permission allowlists etc.)
 .claude/settings.local.json
+
+# encode_media.sh output laid out for the portfolio repo -- copied there, not kept here
+docs/media/portfolio/
+docs/media/render_report.txt
