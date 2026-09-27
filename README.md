@@ -91,13 +91,14 @@ Blender 5.0+ · GPL-3.0-or-later
 
 
 ## Future direction - detail normal map
-    - Artists often use a detail normal map for small-scale surface displacement, like pores,
-      weave or carving. A second "surface detail" level of strokes would paint that relief
-      too, on top of the form-level strokes.
-    - The design is written up in
-      [docs/ideas/detail-normal-level.md](docs/ideas/detail-normal-level.md).
 
-    Details and the ideas that were tried and declined are in [ALGORITHM.md](ALGORITHM.md).
+- Artists often use a detail normal map for small-scale surface displacement, like pores,
+  weave or carving. A second "surface detail" level of strokes would paint that relief
+  too, on top of the form-level strokes.
+- The design is written up in
+  [docs/ideas/detail-normal-level.md](docs/ideas/detail-normal-level.md).
+
+Details and the ideas that were tried and declined are in [ALGORITHM.md](ALGORITHM.md).
 
 ## Project layout
 
@@ -110,7 +111,7 @@ autostroke/
   shaders.py     the shared GLSL stroke search
   gpu_resolve.py the compute-shader bake
   livepreview.py the viewport preview and its operators
-  tests/         the suites above
+  tests/         the test suites
 tools/           in-Blender checks and showcase/media scripts
 docs/            showcase media and design notes
 ALGORITHM.md     the full algorithm, with measurements
@@ -118,4 +119,4 @@ ALGORITHM.md     the full algorithm, with measurements
 
 ## License
 
-GPL-3.0-or-later, as required for Blender add-ons.
+GPL-3.0-or-later, as required for Blender add-ons. See [LICENSE](LICENSE).
