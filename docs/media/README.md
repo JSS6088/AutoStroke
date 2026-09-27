@@ -6,8 +6,8 @@ page (`JSS6088.github.io/projects/autostroke/`). Record or render each asset onc
 
 | File | Made by |
 |---|---|
-| `suzanne_before.png`, `suzanne_after.png` | `tools/render_showcase.py`: a fresh bake of Suzanne, then EEVEE renders |
-| `hero.jpg`, `social_preview.jpg` | `tools/encode_media.sh`, cropped from the renders |
+| `suzanne_before.png`, `suzanne_after.png` | Viewport screenshots of Suzanne, plain and baked. `tools/render_showcase.py` can make rendered versions instead. |
+| `hero.jpg`, `social_preview.jpg` | `tools/encode_media.sh`, from the before/after pair (any matching size) |
 | `live_preview.gif` | `tools/encode_media.sh <recording>`, from your screen recording |
 | `panel.png` | `tools/encode_media.sh <recording> <screenshot>`, from your screenshot |
 
@@ -15,7 +15,7 @@ page (`JSS6088.github.io/projects/autostroke/`). Record or render each asset onc
 repo's `assets/`. Copy its contents there, then uncomment the page's `TODO(media)` blocks
 and the `card:` line in `_data/projects.yml`.
 
-## Re-rendering the stills
+## Rendered stills instead of screenshots
 
 ```bash
 "$BLENDER" --factory-startup PainterlyTexture.blend --python tools/render_showcase.py \

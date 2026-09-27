@@ -38,16 +38,19 @@ for f in "${HERO}_before.png" "${HERO}_after.png"; do
 done
 mkdir -p "$PORT_IMG" "$PORT_VID"
 
-# Stills. render_showcase.py frames the object tightly in 1600x900, so the hero crops each
-# frame to its middle 1100 px and the other formats pad or scale the whole frame. BG is the
-# renders' background grey, used to pad the 2:1 social preview without a visible seam.
-BG="0x2f2f2f"
+# Stills, from before/after frames of any (matching) size -- a render_showcase.py render
+# or a viewport screenshot. The hero puts them side by side; the card and social preview
+# fit the "after" frame and pad it with its own background grey (sampled from a corner).
+BG="0x$(ffmpeg -hide_banner -loglevel error -i "$AFTER" -vf "crop=1:1:5:5" \
+    -f rawvideo -pix_fmt rgb24 - | xxd -p)"
 "${FF[@]}" -i "$BEFORE" -i "$AFTER" \
-    -filter_complex "[0]crop=1100:900[a];[1]crop=1100:900[b];[a][b]hstack=inputs=2,scale=1800:-2" \
-    -q:v 2 "$MEDIA/hero.jpg"
-"${FF[@]}" -i "$AFTER" -vf "scale=-2:640,pad=1280:640:(ow-iw)/2:0:color=$BG" -q:v 2 \
-    "$MEDIA/social_preview.jpg"
-"${FF[@]}" -i "$AFTER" -vf "scale=960:540" -q:v 2 "$PORT_IMG/AutoStroke_card.jpg"
+    -filter_complex "[0][1]hstack=inputs=2,scale='min(1800,iw)':-2" -q:v 2 "$MEDIA/hero.jpg"
+"${FF[@]}" -i "$AFTER" \
+    -vf "scale=1280:640:force_original_aspect_ratio=decrease,pad=1280:640:(ow-iw)/2:(oh-ih)/2:color=$BG" \
+    -q:v 2 "$MEDIA/social_preview.jpg"
+"${FF[@]}" -i "$AFTER" \
+    -vf "scale=960:540:force_original_aspect_ratio=decrease,pad=960:540:(ow-iw)/2:(oh-ih)/2:color=$BG" \
+    -q:v 2 "$PORT_IMG/AutoStroke_card.jpg"
 cp "$BEFORE" "$PORT_IMG/AutoStroke_painterly_off.png"
 cp "$AFTER"  "$PORT_IMG/AutoStroke_painterly_on.png"
 
