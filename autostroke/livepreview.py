@@ -10,18 +10,14 @@ shader that finds each pixel's winning stroke directly. That skips the texture e
 and with it the readback trap: pulling a rendered map back through img.pixels.foreach_set
 costs ~0.3 s of Python for 4M floats, which on its own would make "live" impossible.
 
-    fragment -> object-space position + normal (varyings, no baked maps needed)
-             -> look up its cell in a uniform 3D grid of strokes
-             -> loop that cell, run the same tests resolve_uv runs
+    fragment -> object-space position + normal + its triangle (varyings, no baked maps)
+             -> the strokes that can reach that triangle across the surface (core/reach.py)
+             -> loop them, run the same tests resolve_uv runs
              -> keep the SMALLEST passing stroke, shade with its normal
 
-Strokes are inserted into every cell their bounding box overlaps, so a fragment only ever
-has to read its OWN cell -- the cell contains every stroke that could reach it. That is
-what keeps the shader loop short.
-
-This is a second implementation of the placement rules, and it is deliberately only
-required to LOOK right: `core/baker.resolve_uv` remains the only thing that produces the
-maps you ship. Treat disagreements as a preview bug, never as a reason to change the baker.
+The search itself is shaders.SEARCH, shared verbatim with the GPU bake, and the candidate
+lists come from the same cached reach tables the bake uses -- so the preview shows what
+the bake produces.
 """
 
 import traceback
@@ -30,7 +26,7 @@ import numpy as np
 import bpy
 
 from .bridge import cache as seed_cache, mesh as mesh_bridge, seeds as seed_bridge
-from .core import baker, geometry
+from .core import baker, geometry, reach
 from .core.config import INV_SQRT2
 from .shaders import SEARCH, STROKE_ROWS, STROKE_TILE_W
 
@@ -51,10 +47,13 @@ _error = ""             # last failure, shown in the panel instead of crashing
 # Push constants are limited (128 bytes), and a MAT4 alone is 64 of them -- so the odds
 # and ends are packed into two vec4s and two ivec4s rather than passed individually:
 #
-#   u_grid_lo  = (grid origin .xyz, cos of the Stroke Cutoff)
-#   u_grid_inv = (1 / cell size .xyz, depth offset along the normal)
-#   u_dim_n    = (grid dims .xyz, stroke count)
+#   u_grid_lo  = (unused .xyz, cos of the Stroke Cutoff)
+#   u_grid_inv = (unused .xyz, depth offset along the normal)
+#   u_dim_n    = (triangle count, unused, unused, stroke count)
 #   u_misc     = (list width, cell width, brush atlas columns, view mode)
+#
+# The names predate per-triangle candidate lists, when .xyz carried a 3D grid; kept so the
+# shared search reads the same uniforms in both shaders.
 #
 # That totals exactly 128: MAT4 64 + two VEC4 32 + two IVEC4 32. If a backend rejects it
 # for size, the fix is to drop u_misc -- the texture widths are constants we choose, so
@@ -65,6 +64,7 @@ void main()
 {
     v_pos = pos;                       /* OBJECT space: strokes live here too */
     v_nrm = nrm;
+    v_tri = tri;                       /* flat: the loop-triangle this corner belongs to */
     /* Blender has already rasterised this same mesh by the time a POST_VIEW handler
        runs, so drawing it again at identical depths z-fights -- a fine stipple across
        every flat area. Nudging the rasterised position a hair OUT along the normal puts
@@ -88,12 +88,12 @@ void main()
     int mode = u_misc.w;
 
     if (mode == 2) {                        /* occupancy, for debugging the binning */
-        float f = clamp(float(cell_range(v_pos).y) / 64.0, 0.0, 1.0);
+        float f = clamp(float(tri_range(int(v_tri + 0.5)).y) / 32.0, 0.0, 1.0);
         fragColor = vec4(f, 1.0 - f, 0.0, 1.0);
         return;
     }
 
-    int w = find_stroke(v_pos, v_nrm);
+    int w = find_stroke(v_pos, v_nrm, int(v_tri + 0.5));
     bool found = w >= 0;
     vec3 shade_n = found ? normalize(stroke_row(w, 2).xyz) : n;
     if (mode == 1) {
@@ -113,10 +113,12 @@ def make_shader():
     iface = gpu.types.GPUStageInterfaceInfo("autostroke_live_iface")
     iface.smooth('VEC3', "v_pos")
     iface.smooth('VEC3', "v_nrm")
+    iface.flat('FLOAT', "v_tri")
 
     info = gpu.types.GPUShaderCreateInfo()
     info.vertex_in(0, 'VEC3', "pos")
     info.vertex_in(1, 'VEC3', "nrm")
+    info.vertex_in(2, 'FLOAT', "tri")
     info.vertex_out(iface)
     info.fragment_out(0, 'VEC4', "fragColor")
     info.push_constant('MAT4', "u_mvp")
@@ -136,7 +138,7 @@ def make_shader():
 
 
 # ---------------------------------------------------------------------------
-# Packing: strokes and the spatial grid, built in numpy and uploaded once
+# Packing: strokes and their candidate lists, built in numpy and uploaded once
 # ---------------------------------------------------------------------------
 
 def pack_strokes(seeds, tan, masks, cfg):
@@ -189,56 +191,6 @@ def pack_strokes(seeds, tan, masks, cfg):
     return out, pos, r, T, nrm
 
 
-def build_grid(pos, r, T, nrm, bb_local, max_dim=48):
-    """Bin strokes into a uniform grid, by the SAME box the baker rejects tiles with.
-
-    A stroke goes into every cell its box overlaps, so a fragment only reads its own cell:
-    that cell already holds every stroke that could possibly reach it. Querying a 3x3x3
-    neighbourhood would be the alternative and is 27x the shader work for no gain.
-    """
-    B = np.cross(nrm, T)
-    ctr = (pos + T * (0.5 * (bb_local[:, 0] + bb_local[:, 1]))[:, None]
-           + B * (0.5 * (bb_local[:, 2] + bb_local[:, 3]))[:, None])
-    ext = (np.abs(T) * (0.5 * (bb_local[:, 1] - bb_local[:, 0]))[:, None]
-           + np.abs(B) * (0.5 * (bb_local[:, 3] - bb_local[:, 2]))[:, None]
-           + np.abs(nrm) * r[:, None])
-    lo, hi = ctr - ext, ctr + ext
-
-    gmin = lo.min(0) - 1e-5
-    gmax = hi.max(0) + 1e-5
-    span = np.maximum(gmax - gmin, 1e-6)
-    # cell no smaller than the biggest stroke, or one stroke lands in thousands of cells
-    cell = np.maximum(2.0 * ext.max(0), span / max_dim)
-    dim = np.maximum(np.ceil(span / cell).astype(np.int64), 1)
-    dim = np.minimum(dim, max_dim)
-    cell = span / dim
-
-    i0 = np.clip(((lo - gmin) / cell).astype(np.int64), 0, dim - 1)
-    i1 = np.clip(((hi - gmin) / cell).astype(np.int64), 0, dim - 1)
-
-    # Expand stroke -> cells without a Python loop. Looping took 262 ms at 20,000
-    # strokes, which is what a slider drag would have paid on every tick.
-    span = i1 - i0 + 1                       # cells this stroke covers, per axis
-    per = span.prod(1)                       # ...and in total
-    n_pairs = int(per.sum())
-    sidx = np.repeat(np.arange(len(pos)), per)
-    # index of each pair WITHIN its own stroke's block, then unflattened to x/y/z
-    off = np.arange(n_pairs) - np.repeat(np.cumsum(per) - per, per)
-    sx = span[sidx]
-    cx = i0[sidx, 0] + off % sx[:, 0]
-    cy = i0[sidx, 1] + (off // sx[:, 0]) % sx[:, 1]
-    cz = i0[sidx, 2] + off // (sx[:, 0] * sx[:, 1])
-    cid = cx + dim[0] * (cy + dim[1] * cz)
-    order = np.argsort(cid, kind="stable")
-    pairs = np.stack([cid[order], sidx[order]], 1)
-    n_cells = int(dim.prod())
-    counts = np.bincount(pairs[:, 0], minlength=n_cells)
-    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
-    return (gmin.astype(np.float32), (1.0 / cell).astype(np.float32),
-            dim.astype(np.int32), starts.astype(np.float32),
-            counts.astype(np.float32), pairs[:, 1].astype(np.float32))
-
-
 def pack_brush_atlas(masks, max_tile=512):
     """The brush set as one square atlas, cols x cols tiles. One texture, one sampler.
 
@@ -285,7 +237,7 @@ def stroke_tile_buffer(packed, width=STROKE_TILE_W):
     width-capped RGBA32F texture needs, with stroke i's row r placed at
     (col=i % width, row=(i // width) * 4 + r) -- matching the shader's stroke_row().
     Split out from the GPU upload so this indexing can be tested without bpy/gpu, the
-    same way pack_strokes/build_grid are.
+    same way pack_strokes is.
     """
     n = max(len(packed), 1)
     tile_h = int(np.ceil(n / float(width)))
@@ -317,34 +269,33 @@ def _pack_stroke_texture(packed, width=STROKE_TILE_W):
     return tex
 
 
-def upload_strokes(masks, cfg, seeds, tan, max_dim=48, atlas_tile=512):
+def upload_strokes(masks, cfg, seeds, tan, rs, atlas_tile=512):
     """The four read-only tables the stroke search reads, uploaded to the GPU.
 
     Shared by the live preview and the GPU bake so both search IDENTICAL data: the stroke
-    table (STROKE_ROWS RGBA rows per stroke), the grid's per-cell (start, count), the flat
-    list of stroke indices grouped by cell, and the brush atlas. Every one of them is a
-    fixed-width grid (see shaders.STROKE_TILE_W) so no dimension grows with the stroke
+    table (STROKE_ROWS RGBA rows per stroke), per TRIANGLE the (start, count) of the strokes
+    that can reach it, the flat list of those stroke indices, and the brush atlas. `rs` is
+    core/reach.build()'s result (via bridge/cache.reach_for). Every table is a fixed-width
+    grid (see shaders.STROKE_TILE_W) so no dimension grows with the mesh or the stroke
     count past what Metal accepts.
 
-    `max_dim` caps grid cells per axis; `atlas_tile` caps each brush's atlas tile. The
-    preview keeps both small (it re-uploads on every slider tick); the bake raises them
-    for shorter per-cell loops and full-resolution brushes.
+    `atlas_tile` caps each brush's atlas tile: the preview keeps it small (it re-uploads on
+    every slider tick); the bake passes full-resolution brushes.
     """
     import gpu
     packed, pos, r, T, nrm = pack_strokes(seeds, tan, masks, cfg)
-    bbl = packed[:, 3, :].astype(np.float64)
-    gmin, ginv, dim, starts, counts, lst = build_grid(pos, r, T, nrm, bbl, max_dim=max_dim)
 
     stroke_tex = _pack_stroke_texture(packed)
+    n_tris = int(rs["n_tris"])
     cell_w = 4096
-    cell_h = int(np.ceil(len(counts) / float(cell_w)))
+    cell_h = int(np.ceil(max(n_tris, 1) / float(cell_w)))
     cbuf = np.zeros((cell_w * cell_h, 2), np.float32)
-    cbuf[:len(counts), 0] = starts
-    cbuf[:len(counts), 1] = counts
+    cbuf[:n_tris, 0] = rs["tri_start"]
+    cbuf[:n_tris, 1] = rs["tri_count"]
     cell_tex = gpu.types.GPUTexture(
         (cell_w, cell_h), format='RG32F',
         data=gpu.types.Buffer('FLOAT', cell_w * cell_h * 2, cbuf.ravel()))
-    list_tex, list_w = _flat_texture(lst)
+    list_tex, list_w = _flat_texture(rs["tri_strokes"].astype(np.float32))
 
     atlas, cols = pack_brush_atlas(masks, max_tile=atlas_tile)
     brush_tex = gpu.types.GPUTexture(
@@ -352,8 +303,7 @@ def upload_strokes(masks, cfg, seeds, tan, max_dim=48, atlas_tile=512):
         data=gpu.types.Buffer('FLOAT', atlas.size, np.ascontiguousarray(atlas).ravel()))
 
     return dict(stroke=stroke_tex, cell=cell_tex, lst=list_tex, brush=brush_tex,
-                grid_lo=gmin, grid_inv=ginv, grid_dim=dim, n=len(pos),
-                cell_w=cell_w, list_w=list_w, cols=cols)
+                n=len(pos), n_tris=n_tris, cell_w=cell_w, list_w=list_w, cols=cols)
 
 
 def bind_stroke_tables(shader, up):
@@ -392,7 +342,8 @@ def _build(context, obj):
                 seeds["position"].astype(np.float32), seeds["normal"].astype(np.float32), cfg)
         seed_cache.put(ckey, seeds, stats, tan, curv)
 
-    up = upload_strokes(masks, cfg, seeds, tan)
+    rs = seed_cache.reach_for(ckey, cfg, lambda: reach.build_for_seeds(seeds, cfg))
+    up = upload_strokes(masks, cfg, seeds, tan, rs)
 
     me = obj.evaluated_get(context.evaluated_depsgraph_get()).to_mesh()
     try:
@@ -425,12 +376,19 @@ def _build(context, obj):
             me.vertices.foreach_get("normal", vn)
             vnrm = vn.reshape(-1, 3)[tri_v].reshape(-1, 3)
         vpos = co[tri_v].reshape(-1, 3)
+        # Each corner carries its loop-triangle index, so a fragment knows which triangle
+        # it is on -- the key into the reach lists. Same loop_triangles order as the seeds'
+        # triangles (bridge/mesh.read_triangles), so the index means the same thing.
+        vtri = np.repeat(np.arange(nt, dtype=np.float32), 3)
     finally:
         obj.evaluated_get(context.evaluated_depsgraph_get()).to_mesh_clear()
 
     from gpu_extras.batch import batch_for_shader
     shader = make_shader()
-    batch = batch_for_shader(shader, 'TRIS', {"pos": vpos, "nrm": vnrm})
+    if nt != up["n_tris"]:
+        raise mesh_bridge.MeshError(
+            "%s changed since its strokes were placed -- press Refresh" % obj.name)
+    batch = batch_for_shader(shader, 'TRIS', {"pos": vpos, "nrm": vnrm, "tri": vtri})
     # 0.1% of the bounding-box diagonal: enough to win the depth test, far too small to
     # show as the silhouette creeping outwards.
     diag = float(np.linalg.norm(vpos.max(0) - vpos.min(0)))
@@ -459,19 +417,12 @@ def _draw():
         sh.uniform_float("u_mvp", mvp)
         bind_stroke_tables(sh, s)
         # packed to stay inside the 128-byte push-constant budget; see make_shader()
-        lo = s["grid_lo"]
-        inv = s["grid_inv"]
-        dim = s["grid_dim"]
         # read live from the scene: Stroke Cutoff is one uniform, so it costs nothing to
         # change and should not go through a rebuild
         cos_cut = float(np.cos(st.crease_angle))     # the prop is already radians
-        sh.uniform_float("u_grid_lo",
-                         (float(lo[0]), float(lo[1]), float(lo[2]), cos_cut))
-        sh.uniform_float("u_grid_inv",
-                         (float(inv[0]), float(inv[1]), float(inv[2]),
-                          s["depth_offset"]))
-        sh.uniform_int("u_dim_n",
-                       (int(dim[0]), int(dim[1]), int(dim[2]), int(s["n"])))
+        sh.uniform_float("u_grid_lo", (0.0, 0.0, 0.0, cos_cut))
+        sh.uniform_float("u_grid_inv", (0.0, 0.0, 0.0, s["depth_offset"]))
+        sh.uniform_int("u_dim_n", (int(s["n_tris"]), 0, 0, int(s["n"])))
         sh.uniform_int("u_misc",
                        (int(s["list_w"]), int(s["cell_w"]), int(s["cols"]),
                         int(st.live_mode)))
@@ -537,7 +488,7 @@ def rebuild(context):
         _state = _build(context, obj)
         _error = ""
         return True
-    except mesh_bridge.MeshError as e:
+    except (mesh_bridge.MeshError, reach.ReachError) as e:
         # Settings this one object cannot satisfy -- too many strokes, no UV map. The
         # PREVIOUS state is kept and the preview left ON: an artist who drags a slider
         # too far sees the reason and drags back, rather than having to notice the

@@ -1,10 +1,9 @@
-"""The numpy half of the live preview: stroke packing and the spatial grid.
+"""The numpy half of the live preview: stroke packing, the atlas, and the wiring.
 
 The shader itself cannot be tested here -- it needs a GPU and a running Blender. What CAN
-be tested is the part most likely to be quietly wrong: the binning. The shader reads only
-a fragment's OWN cell, which is only correct if every stroke was inserted into every cell
-its bounding box overlaps. Get that wrong and strokes vanish in bands, which reads as a
-placement bug rather than a binning bug.
+be tested is what feeds it. The candidate lists the shader loops over are the reach tables
+(core/reach.py), proven complete and exact in test_reach.py; this file checks the stroke
+table, the brush atlas, and that the preview hands the search the right triangle.
 
 Run directly: python3 autostroke/tests/test_live.py
 """
@@ -32,7 +31,7 @@ def _load_pure():
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "livepreview.py")
     tree = ast.parse(open(path).read())
-    want = {"pack_strokes", "build_grid", "pack_brush_atlas", "stroke_tile_buffer"}
+    want = {"pack_strokes", "pack_brush_atlas", "stroke_tile_buffer"}
     keep = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in want]
     if len(keep) != len(want):
         raise SystemExit("livepreview.py no longer defines %s"
@@ -110,52 +109,6 @@ def main():
     check("the painted box is non-empty and inside the stamp square",
           (packed[:, 3, 1] > packed[:, 3, 0]).all() and (packed[:, 3, 3] > packed[:, 3, 2]).all()
           and (packed[:, 3, 1] <= r * 2 * INV_SQRT2 * 0.5 + 1e-5).all())
-
-    # ---- the load-bearing one: the grid must be conservative ---------------
-    print()
-    bbl = packed[:, 3, :].astype(np.float64)
-    gmin, ginv, dim, starts, counts, lst = LP.build_grid(pos, r, T, nrm, bbl)
-    n_cells = int(np.prod(dim))
-    check("grid dims are sane", n_cells > 0 and n_cells == len(counts),
-          "%dx%dx%d = %s cells" % (dim[0], dim[1], dim[2], "{:,}".format(n_cells)))
-    check("every stroke is binned at least once",
-          len(np.unique(lst.astype(np.int64))) == len(pos),
-          "%d of %d strokes appear" % (len(np.unique(lst.astype(np.int64))), len(pos)))
-
-    # For a sample of points that a stroke could paint, that stroke must be in the cell
-    # the shader will look in -- otherwise the shader silently misses it.
-    B = np.cross(nrm, T)
-    rng = np.random.default_rng(7)
-    misses = tested = 0
-    for j in rng.choice(len(pos), 120, replace=False):
-        a = rng.uniform(bbl[j, 0], bbl[j, 1], 40)
-        b = rng.uniform(bbl[j, 2], bbl[j, 3], 40)
-        p = pos[j] + T[j] * a[:, None] + B[j] * b[:, None]
-        p = p[((p - pos[j]) ** 2).sum(1) < r[j] ** 2]        # only points it can paint
-        for q in p:
-            c = np.clip(((q - gmin) * ginv).astype(np.int64), 0, dim - 1)
-            cid = int(c[0] + dim[0] * (c[1] + dim[1] * c[2]))
-            here = lst[int(starts[cid]):int(starts[cid]) + int(counts[cid])].astype(np.int64)
-            tested += 1
-            if j not in here:
-                misses += 1
-    check("a stroke is in the cell of every point it can paint", misses == 0,
-          "%s points checked, %d missed" % ("{:,}".format(tested), misses))
-    check("cells stay short enough for a shader loop", counts.max() <= 512,
-          "largest cell holds %d strokes, mean %.1f" % (counts.max(), counts.mean()))
-
-    # The property that actually matters: the loop must NOT grow with stroke count. The
-    # grid refines as strokes shrink, so it should not -- but only if the seeds shrink,
-    # which is why the fixture scales radius with n.
-    worst = []
-    for n in (1000, 4000, 20000):
-        sn = fake_seeds(n)
-        pk, pp, rr, TT, NN = LP.pack_strokes(sn, sn["normal"].astype(np.float64), masks, cfg)
-        _, _, _, _, cts, _ = LP.build_grid(pp, rr, TT, NN, pk[:, 3, :].astype(np.float64))
-        worst.append((n, int(cts.max())))
-    check("the shader loop does not grow with stroke count",
-          worst[-1][1] < 3 * worst[0][1],
-          " ".join("%s->%d" % (format(n, ","), c) for n, c in worst))
 
     # ---- brush atlas -------------------------------------------------------
     print()
@@ -375,8 +328,30 @@ def shared_search():
     FRAG = ns["FRAG"]
     check("FRAG starts with shaders.SEARCH, verbatim", FRAG.startswith(shaders.SEARCH))
     check("...and its main() only calls the search, it has no loop of its own",
-          "find_stroke(v_pos, v_nrm)" in FRAG
+          "find_stroke(v_pos, v_nrm, int(v_tri + 0.5))" in FRAG
           and FRAG[len(shaders.SEARCH):].count("for (") == 0)
+    check("the search takes the point's TRIANGLE and reads only that triangle's list",
+          "int find_stroke(vec3 p, vec3 n_in, int tri)" in shaders.SEARCH
+          and "tri_range(tri)" in shaders.SEARCH and "cell_range" not in shaders.SEARCH)
+    check("an unknown triangle (-1) paints nothing rather than reading list 0",
+          "if (tri < 0 || tri >= u_dim_n.x) return -1;" in shaders.SEARCH)
+
+    # the preview's triangle attribute: corner k of the unindexed batch is triangle k // 3,
+    # the same loop_triangles index the reach lists are keyed by
+    build = next(n for n in tree.body
+                 if isinstance(n, ast.FunctionDef) and n.name == "_build")
+    vt = [n for n in ast.walk(build) if isinstance(n, ast.Assign)
+          and isinstance(n.targets[0], ast.Name) and n.targets[0].id == "vtri"]
+    check("_build defines the triangle attribute once", len(vt) == 1)
+    if len(vt) == 1:
+        ns2 = {"np": np, "nt": 5}
+        exec(compile(ast.Module(body=vt, type_ignores=[]), "<lp>", "exec"), ns2)
+        check("corner k carries triangle k // 3",
+              np.array_equal(ns2["vtri"], np.arange(15) // 3), str(ns2["vtri"]))
+    src = open(path).read()
+    check("the batch uploads it and the shader declares it as a flat varying",
+          '"tri": vtri' in src and "iface.flat('FLOAT', \"v_tri\")" in src
+          and "info.vertex_in(2, 'FLOAT', \"tri\")" in src)
 
     print("\nBRUSH ATLAS KEEPS FULL RESOLUTION WHEN THE BAKE ASKS FOR IT")
     big = [np.random.default_rng(k).random((1024, 1024)).astype(np.float32) for k in range(3)]

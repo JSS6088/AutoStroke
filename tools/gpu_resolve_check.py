@@ -18,6 +18,12 @@ What it reports:
      texels both cover, how often they picked the same winner (same UV pointer and same
      luminance -- a winner's two identifying per-stroke constants).
   3. timings for both resolvers.
+  4. reachable surface (core/reach.py): how many texels the UNRESTRICTED search gave to a
+     stroke on a different connected part of the mesh (the bug reach fixes), and the same
+     count with reach on (must be 0), plus reach build time and strokes per triangle.
+
+Object "__stacked__" builds, in memory only, two stacked 1 m planes 2 mm apart as one mesh
+with separate UV islands -- the smallest case of the bug.
 """
 
 import os
@@ -72,8 +78,51 @@ void main()
     return ok
 
 
+def stacked_planes():
+    """Two 1 m planes 2 mm apart, one mesh, each on its own half of the UV square."""
+    n = 24
+    verts, faces = [], []
+    for layer, z in enumerate((0.0, 0.002)):
+        base = len(verts)
+        for j in range(n + 1):
+            for i in range(n + 1):
+                verts.append((i / n - 0.5, j / n - 0.5, z))
+        for j in range(n):
+            for i in range(n):
+                a = base + j * (n + 1) + i
+                faces.append((a, a + 1, a + n + 2, a + n + 1))
+    me = bpy.data.meshes.new("__stacked__")
+    me.from_pydata(verts, [], faces)
+    uv = me.uv_layers.new(name="UVMap")
+    for poly in me.polygons:
+        for li in poly.loop_indices:
+            x, y, z = me.vertices[me.loops[li].vertex_index].co
+            uv.data[li].uv = ((x + 0.5) * 0.48 + (0.5 if z > 0.001 else 0.01),
+                              (y + 0.5) * 0.96 + 0.02)
+    obj = bpy.data.objects.new("__stacked__", me)
+    bpy.context.scene.collection.objects.link(obj)
+    return obj
+
+
+def components(adj, T):
+    """Connected-component label per triangle, by min-label propagation."""
+    import numpy as np
+    start, nbr = adj
+    lab = np.arange(T)
+    has = np.diff(start) > 0
+    while True:
+        m = lab.copy()
+        m[has] = np.minimum(lab[has], np.minimum.reduceat(lab[nbr], start[:-1][has]))
+        m = m[m]                                  # pointer jumping
+        if np.array_equal(m, lab):
+            return lab
+        lab = m
+
+
 def pick_object():
     from autostroke.ops import setup as setup_ops
+    if OBJ == "__stacked__":
+        return stacked_planes()
     if OBJ:
         o = bpy.data.objects.get(OBJ)
         return o if o is not None and not setup_ops.validate(o) else None
@@ -89,7 +138,7 @@ def pick_object():
 def parity():
     import numpy as np
     from autostroke import gpu_resolve
-    from autostroke.core import baker, geometry
+    from autostroke.core import baker, geometry, reach
     from autostroke.core.config import Config
     from autostroke.bridge import position as pos_bridge, seeds as seed_bridge
     from autostroke.ops.bake import config_from_settings, load_brush
@@ -133,16 +182,60 @@ def parity():
     pts, uvs, pns = flat[valid], uv_self[valid], flat_n[valid]
     log("   valid texels: %s" % "{:,}".format(len(pts)))
 
+    # exactly the reach setup ops/bake.py does
+    m = seeds["_mesh"]
     t = time.perf_counter()
-    cpu = baker.resolve_uv_blocking(
-        pts, uvs, seeds["position"].astype(np.float32), seeds["id"].astype(np.int64),
-        seeds["UVMap"].astype(np.float32), seeds["radius"].astype(np.float32),
-        seeds["normal"].astype(np.float32), None, masks, cfg, tan, cfg.stamp_rotate_deg,
-        pt_nrm=pns)
-    t_cpu = time.perf_counter() - t
+    tri_map = reach.raster_tri_ids(m["uvP"], m["uvQ"], m["uvR"], m["P"], m["Q"], m["R"],
+                                   H, W, pos_map=flat, valid=valid,
+                                   margin=pos_bridge.BAKE_MARGIN)
+    t_raster = time.perf_counter() - t
+    t = time.perf_counter()
+    rs = reach.build_for_seeds(seeds, cfg)
+    t_reach = time.perf_counter() - t
+    tri = tri_map[valid]
+    log("   texel -> triangle map: %.2fs  (%d valid texels without a triangle)"
+        % (t_raster, int((tri < 0).sum())))
+    log("   reach tables: %.2fs  (%s triangles, %s pairs, strokes per triangle mean %.1f, "
+        "max %d)" % (t_reach, "{:,}".format(rs["n_tris"]), "{:,}".format(rs["pairs"]),
+                     rs["tri_count"].mean(), rs["tri_count"].max()))
+
+    def cpu_run(with_reach):
+        kw = dict(pt_tri=tri, stroke_reach=(rs["stroke_start"], rs["stroke_tris"])) \
+            if with_reach else {}
+        return baker.resolve_uv_blocking(
+            pts, uvs, seeds["position"].astype(np.float32), seeds["id"].astype(np.int64),
+            seeds["UVMap"].astype(np.float32), seeds["radius"].astype(np.float32),
+            seeds["normal"].astype(np.float32), None, masks, cfg, tan, cfg.stamp_rotate_deg,
+            pt_nrm=pns, **kw)
+
+    # which stroke won each texel, from its UV pointer + luminance (unique per stroke here)
+    key_uv = seeds["UVMap"].astype(np.float32)
+    lut = {(float(u), float(v)): i for i, (u, v) in enumerate(key_uv)}
+
+    def winners(out):
+        w = np.array([lut.get((float(a), float(b)), -1) for a, b in out[0]])
+        return np.where(out[2], w, -1)
+
+    comp = components(reach.tri_adjacency(reach.weld(m["P"], m["Q"], m["R"])), rs["n_tris"])
+
+    def cross(out):
+        w = winners(out)
+        ok = (w >= 0) & (tri >= 0)
+        return int((comp[seeds["_tri"][w[ok]]] != comp[tri[ok]]).sum()), int(ok.sum())
 
     t = time.perf_counter()
-    gen = gpu_resolve.resolve(pts, uvs, pns, seeds, tan, masks, cfg)
+    old = cpu_run(False)
+    t_old = time.perf_counter() - t
+    t = time.perf_counter()
+    cpu = cpu_run(True)
+    t_cpu = time.perf_counter() - t
+    log("4. texels won by a stroke on ANOTHER connected part: without reach %s of %s,"
+        " with reach %s of %s" % (*("{:,}".format(x) for x in cross(old)),
+                                  *("{:,}".format(x) for x in cross(cpu))))
+    log("   CPU resolve without reach %.2fs, with reach %.2fs" % (t_old, t_cpu))
+
+    t = time.perf_counter()
+    gen = gpu_resolve.resolve(pts, uvs, pns, seeds, tan, masks, cfg, tri, rs)
     try:
         while True:
             next(gen)
@@ -162,6 +255,8 @@ def parity():
            "{:,}".format(int(both.sum()))))
     log("   winner-normal max diff where same winner: %.2e"
         % (float(np.abs(cd[same] - gd[same]).max()) if same.any() else 0.0))
+    log("   GPU winners on another connected part: %s of %s"
+        % tuple("{:,}".format(x) for x in cross(gpu_out)))
     log("3. timing: CPU resolve %.2fs   GPU resolve %.3fs   (x%.0f)"
         % (t_cpu, t_gpu, t_cpu / max(t_gpu, 1e-6)))
 

@@ -159,6 +159,11 @@ def layout(gpu_resolve):
               and not p.reshape(-1, 4)[m:].any())
         check("pack_chunk(%d): element i at (i // %d, i %% %d), padding zero" % (m, W, W),
               ok, "shape %s" % (p.shape,))
+    tri = np.array([0, 7, 16_777_215, 123_456], np.int64)          # up to 2**24 - 1
+    p = gpu_resolve.pack_chunk(np.zeros((4, 3), np.float32), tri)
+    check("pack_chunk carries the triangle id in .w, exactly, up to 2**24 - 1",
+          np.array_equal(p.reshape(-1, 4)[:4, 3].astype(np.int64), tri)
+          and not p.reshape(-1, 4)[4:].any())
     check("a chunk's texture is never wider than 4096 (Metal caps at 16384)",
           gpu_resolve.pack_chunk(np.zeros((gpu_resolve.CHUNK, 3), np.float32)).shape[1] <= 4096)
 
@@ -193,8 +198,9 @@ def kernel_source(gpu_resolve, shaders):
     print("\nTHE KERNEL RUNS THE SHARED SEARCH, NOT A COPY OF IT")
     check("compute source contains shaders.SEARCH verbatim",
           shaders.SEARCH in gpu_resolve.COMPUTE)
-    check("...and calls find_stroke once per texel",
-          gpu_resolve.COMPUTE.count("find_stroke(pos, nrm)") == 1)
+    check("...and calls find_stroke once per texel, with the texel's triangle",
+          gpu_resolve.COMPUTE.count("find_stroke(pt.xyz, nrm, int(pt.w))") == 1
+          and "vec4 pt = texelFetch(u_pts, p, 0);" in gpu_resolve.COMPUTE)
     check("layout tokens were substituted (no raw token left)",
           "STROKE_TILE_W" not in gpu_resolve.COMPUTE
           and "STROKE_ROWS" not in gpu_resolve.COMPUTE

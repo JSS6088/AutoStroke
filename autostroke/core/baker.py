@@ -8,6 +8,7 @@ import numpy as np
 
 from .config import INV_SQRT2
 from .geometry import frame_from_tangent, quat_to_TB
+from .reach import in_sorted
 
 def mask_from_rgba(arr, cfg):
     """(H,W[,C]) float array in [0,1] -> a single-channel brush mask.
@@ -155,6 +156,21 @@ def auto_chunk(n_texels, n_seeds):
     return int(np.clip(np.sqrt(float(n_texels) * max(n_seeds, 1)) / 128.0, 1024, 16384))
 
 
+def effective_radius(seed_r, seed_id, cfg):
+    """The radius a stroke actually paints with: seed radius x Stroke Size x the per-stroke
+    size variation. The one place it is built -- resolve_uv's sphere, footprint and order
+    all follow from it, and core/reach.py sizes each stroke's reachable surface with it, so
+    the reach sets can never be sized differently from the search they filter.
+
+    Size variation is exponential so the spread is symmetric about the dial: at
+    size_random 1.0 the factor runs 0.5x..2x and halving is as likely as doubling."""
+    size_var = float(np.clip(getattr(cfg, "size_random", 0.0), 0.0, 1.0))
+    r_eff = np.asarray(seed_r).astype(np.float64) * cfg.mask_scale
+    if size_var:
+        r_eff = r_eff * 2.0 ** ((hash01(seed_id ^ np.int64(SALT_SIZE)) * 2.0 - 1.0) * size_var)
+    return r_eff
+
+
 def resolve_uv_blocking(*args, **kw):
     """Drain resolve_uv and return its result, for callers that cannot yield.
 
@@ -171,7 +187,8 @@ def resolve_uv_blocking(*args, **kw):
 
 def resolve_uv(points, uv_self, seeds, seed_id, seed_uv, seed_r,
                seed_nrm, seed_rot, mask, cfg, seed_tan=None,
-               stamp_rot_deg=0.0, pt_nrm=None, counters=None):
+               stamp_rot_deg=0.0, pt_nrm=None, counters=None,
+               pt_tri=None, stroke_reach=None):
     """GENERATOR. Yields progress in 0..1 after each texel chunk; returns the result
     tuple via StopIteration.value (use resolve_uv_blocking if you just want the value).
 
@@ -183,6 +200,12 @@ def resolve_uv(points, uv_self, seeds, seed_id, seed_uv, seed_r,
     them -- with a list each stroke draws one by brush_index(), and each brush's own long
     axis is what mask_auto_align lines up. Returns (uv_out (M,2), dbg_out (M,3) encoded
     normal, covered (M,), lum_out (M,)).
+
+    `pt_tri` (the triangle each texel belongs to, -1 if unknown) and `stroke_reach`
+    ((start, tris) from core/reach.py: stroke i reaches the sorted tris[start[i]:start[i+1]])
+    restrict every stroke to surface it can reach ACROSS the mesh -- see core/reach.py for
+    why distance alone let strokes paint stacked layers and folds. Both None keeps the
+    unrestricted search, byte-identical to before.
 
     Pass a dict as `counters` to have the work actually done accumulated into it:
     `tiles`, `tile_size`, `pairs` (stroke-tile pairs surviving rejection) and `footprint`
@@ -197,6 +220,10 @@ def resolve_uv(points, uv_self, seeds, seed_id, seed_uv, seed_r,
     uv_self = np.asarray(uv_self)[perm]
     if pt_nrm is not None:
         pt_nrm = np.asarray(pt_nrm)[perm]
+    reach = pt_tri is not None and stroke_reach is not None
+    if reach:
+        pt_tri = np.asarray(pt_tri, np.int64)[perm]
+        r_start, r_tris = stroke_reach
     uv_out  = uv_self.copy()
     dbg_out = np.zeros((M, 3), np.float32)
     lum_out = np.full(M, 0.5, np.float32)          # per-cell random -> B channel (0.5 = neutral)
@@ -235,15 +262,9 @@ def resolve_uv(points, uv_self, seeds, seed_id, seed_uv, seed_r,
             ang += (hash01(seed_id ^ np.int64(0x9e3779b9)) * 2.0 - 1.0) * np.radians(jitter)
         _ca, _sa = np.cos(ang)[:, None], np.sin(ang)[:, None]
         T_all, B_all = T_all * _ca + B_all * _sa, -T_all * _sa + B_all * _ca
-    # Per-stroke size variation, exponential so the spread is symmetric about the dial:
-    # at size_random 1.0 the factor runs 0.5x..2x and halving is as likely as doubling,
-    # where a linear 1 +/- r would put the ends at 0.5x and 1.5x and read as "mostly
-    # bigger". This is the single place the effective radius is built, so the broad phase
-    # (r2_ord) and the footprint (h_ord) both follow from it -- and so does the order.
-    size_var = float(np.clip(getattr(cfg, "size_random", 0.0), 0.0, 1.0))
-    r_eff = seed_r.astype(np.float64) * cfg.mask_scale
-    if size_var:
-        r_eff = r_eff * 2.0 ** ((hash01(seed_id ^ np.int64(SALT_SIZE)) * 2.0 - 1.0) * size_var)
+    # The broad phase (r2_ord), the footprint (h_ord) and the order all follow from this
+    # one radius -- and so do the reach sets, which effective_radius also sizes.
+    r_eff = effective_radius(seed_r, seed_id, cfg)
 
     # Candidate order: the loop below awards each texel to the FIRST candidate that covers
     # it, so sorting smallest-first is exactly "a fine mark is never swallowed by a coarse
@@ -353,6 +374,14 @@ def resolve_uv(points, uv_self, seeds, seed_id, seed_uv, seed_r,
             h = h_ord[j]
             infoot = (within & (lu > lu_lo[j]) & (lu < lu_hi[j])
                       & (lv > lv_lo[j]) & (lv < lv_hi[j]) & ~done)
+            if reach and infoot.any():
+                # Only surface this stroke can reach across the mesh (core/reach.py).
+                # Before the mask on purpose: an AND with the other tests, so the order
+                # cannot change the answer, and texels it drops skip the mask sample.
+                _fi = np.flatnonzero(infoot)
+                _o = order[j]
+                _ok = in_sorted(pt_tri[a:b][_fi], r_tris[r_start[_o]:r_start[_o + 1]])
+                infoot[_fi[~_ok]] = False
             if not infoot.any():
                 continue
             # sample the mask only for footprint texels, then threshold

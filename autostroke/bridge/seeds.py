@@ -141,4 +141,10 @@ def build_seeds(obj, target_strokes, min_strokes=1, max_strokes=128, alpha=0.5,
     )
     seeds["_face_id"] = face_id
     seeds["_within"] = within
+    # What core/reach.py needs to keep each stroke on surface it can reach: the triangle
+    # it was placed on, and the triangles themselves (object space, loop_triangles order
+    # -- the same order the preview draws and the bake's texel raster uses).
+    seeds["_tri"] = t.astype(np.int64)
+    seeds["_mesh"] = dict(P=m["P"], Q=m["Q"], R=m["R"],
+                          uvP=m["uvP"], uvQ=m["uvQ"], uvR=m["uvR"])
     return seeds, stats

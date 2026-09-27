@@ -12,8 +12,7 @@ UV-seam artifacts.*
 ![Live preview: dragging Stroke Count and Stroke Size updates the viewport in real time](docs/media/live_preview.gif)
 -->
 
-[Project page](https://jss6088.github.io/projects/autostroke/autostroke.html) ·
-[Walkthrough video](https://www.youtube.com/watch?v=2QAXQjJjKY4) ·
+[Project page and walkthrough video](https://jss6088.github.io/projects/autostroke/autostroke.html) ·
 [How the algorithm works](ALGORITHM.md) ·
 Blender 5.0+ · GPL-3.0-or-later
 
@@ -46,7 +45,7 @@ Blender 5.0+ · GPL-3.0-or-later
 
 ## Install
 
-1. Download [`autostroke-0.12.1.zip`](autostroke-0.12.1.zip).
+1. Download [`autostroke-0.13.0.zip`](autostroke-0.13.0.zip).
 2. In Blender 5.0 or later: **Edit → Preferences → Get Extensions**, then the **▾** menu
    at the top right → **Install from Disk…**, and pick the zip.
 
@@ -84,6 +83,9 @@ Blender 5.0+ · GPL-3.0-or-later
    - Cycles bakes each texel's 3D position and normal.
    - Every texel then takes the **smallest** stroke whose brush shape covers it and whose
      normal agrees with the surface there.
+   - A stroke only reaches surface it can travel to **across the mesh**, so it never
+     jumps to a stacked layer, a floating part or the far side of a fold
+     ([§2.10](ALGORITHM.md#210-reachable-surface)).
 3. **Output.**
    - The winner's normal goes into the stroke normal map, and its UV pointer and tone into
      the indirection map.

@@ -77,8 +77,61 @@ def main():
     check("int and float clamps do not make different keys",
           cache.key(SIG, 4000, 1, 128, 0.5) == cache.key(SIG, 4000.0, 1.0, 128.0, 0.5))
 
+    reach_slot()
+
     print("\n%s\n" % ("ALL PASS" if not FAILED else "FAILED: " + ", ".join(FAILED)))
     return 1 if FAILED else 0
+
+
+def reach_slot():
+    """The reach tables depend on the seeds AND on the radius strokes paint with -- Stroke
+    Size and Size Variation. A hit after either changed would keep strokes on stale reach
+    sets: sized for the old radius, they would clip strokes or let them reach too far.
+    Every other look dial must NOT rebuild them, or a rotation drag would pay for it."""
+    print("\nREACH TABLES AND TEXEL TRIANGLE MAP")
+    cache.clear()
+    built = []
+
+    def cfg(**kw):
+        base = dict(mask_scale=4.0, size_random=0.0, stamp_rotate_deg=0.0,
+                    rot_jitter_deg=0.0, crease_angle_deg=45.0, brush="standard")
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def get(seed_key, c):
+        return cache.reach_for(seed_key, c, lambda: built.append(1) or len(built))
+
+    sk = cache.key("mesh", 4000, 1, 128, 0.5)
+    first = get(sk, cfg())
+    check("a cold reach slot builds", len(built) == 1)
+    check("the same seeds and radius settings hit",
+          get(sk, cfg()) == first and len(built) == 1)
+    for label, c in (("Global Rotation", cfg(stamp_rotate_deg=30.0)),
+                     ("Rotation Jitter", cfg(rot_jitter_deg=20.0)),
+                     ("Stroke Cutoff", cfg(crease_angle_deg=70.0)),
+                     ("the brush set", cfg(brush="rough"))):
+        n = len(built)
+        get(sk, c)
+        check("%s does NOT rebuild reach" % label, len(built) == n)
+    for label, key_, c in (("Stroke Size", sk, cfg(mask_scale=5.0)),
+                           ("Size Variation", sk, cfg(size_random=0.5)),
+                           ("the seeds (mesh or count)", cache.key("mesh", 5000, 1, 128, 0.5),
+                            cfg())):
+        get(sk, cfg())                      # back to the baseline: only `label` differs
+        n = len(built)
+        get(key_, c)
+        check("%s rebuilds reach" % label, len(built) == n + 1)
+
+    maps = []
+    one = cache.tri_map_for("sig|res=1024", lambda: maps.append(1) or "A")
+    two = cache.tri_map_for("sig|res=1024", lambda: maps.append(1) or "B")
+    three = cache.tri_map_for("sig|res=2048", lambda: maps.append(1) or "C")
+    check("the texel triangle map is kept per mesh + resolution",
+          (one, two, three) == ("A", "A", "C") and len(maps) == 2)
+    cache.clear()
+    check("clear() empties the reach and texel-map slots too",
+          cache.reach_for(sk, cfg(), lambda: "fresh") == "fresh"
+          and cache.tri_map_for("sig|res=2048", lambda: "fresh") == "fresh")
 
 
 if __name__ == "__main__":

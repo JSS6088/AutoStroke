@@ -9,8 +9,11 @@ No imports, no bpy: this module is plain strings so it can be read by the tests 
 shader builders without dragging a GPU context into either.
 
 What the search must reproduce is core/baker.resolve_uv, per texel:
-  - candidates are the strokes binned into this point's grid cell (the grid is only a
-    speed-up -- it never excludes a stroke that could win);
+  - candidates are the strokes that can REACH this point's triangle across the surface
+    (core/reach.py). The list is complete by construction -- any stroke whose sphere
+    reaches the point on connected surface has the point's triangle in its reach set --
+    and it is also the rule itself: a stroke outside the list may not paint here, which is
+    what keeps strokes off stacked layers, floating parts and the far side of folds;
   - sphere:   |p - centre|^2 < r^2          (bounds thickness off the stroke's plane)
   - box:      lu, lv inside the painted rectangle, in the stroke's own (T, B) frame
   - mask:     the brush image, bilinear, > 0.5 -- computed by HAND with texelFetch using
@@ -39,15 +42,11 @@ vec4 stroke_row(int i, int row)
     return texelFetch(u_stroke, tc, 0);
 }
 
-/* (start, count) of the grid cell containing object-space point p, into u_list */
-ivec2 cell_range(vec3 p)
+/* (start, count) into u_list of the strokes that can reach triangle `tri` */
+ivec2 tri_range(int tri)
 {
-    ivec3 gdim = u_dim_n.xyz;
-    ivec3 c = ivec3(floor((p - u_grid_lo.xyz) * u_grid_inv.xyz));
-    c = clamp(c, ivec3(0), gdim - 1);
-    int cell = c.x + gdim.x * (c.y + gdim.y * c.z);
     int cell_w = u_misc.y;
-    vec2 sc = texelFetch(u_cell, ivec2(cell % cell_w, cell / cell_w), 0).rg;
+    vec2 sc = texelFetch(u_cell, ivec2(tri % cell_w, tri / cell_w), 0).rg;
     return ivec2(int(sc.x), int(sc.y));
 }
 
@@ -74,14 +73,18 @@ float brush_mask(int bi, vec2 m)
          + c * (1.0 - fx) * fy + d * fx * fy;
 }
 
-/* The placement rule. Returns the winning stroke's index, or -1 if no stroke paints p. */
-int find_stroke(vec3 p, vec3 n_in)
+/* The placement rule. p and n_in are the point's object-space position and surface
+   normal, tri the triangle it lies on (-1 if unknown: nothing paints it, and it falls
+   back to the true surface normal like any uncovered texel). Returns the winning stroke's
+   index, or -1 if no stroke paints p. */
+int find_stroke(vec3 p, vec3 n_in, int tri)
 {
+    if (tri < 0 || tri >= u_dim_n.x) return -1;
     vec3 n = (dot(n_in, n_in) > 1e-24) ? normalize(n_in) : vec3(0.0);
     int nstroke = u_dim_n.w;
     int list_w = u_misc.x;
     float cos_cut = u_grid_lo.w;
-    ivec2 sc = cell_range(p);
+    ivec2 sc = tri_range(tri);
 
     float best_r = 1e30;
     int best = -1;

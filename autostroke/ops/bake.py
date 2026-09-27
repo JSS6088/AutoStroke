@@ -10,7 +10,7 @@ import numpy as np
 import bpy
 
 from ..core.config import Config
-from ..core import baker, geometry
+from ..core import baker, geometry, reach
 from ..bridge import brushes as brush_bridge, cache as seed_cache
 from ..bridge import images as bi, mesh as mesh_bridge
 from ..bridge import position as pos_bridge
@@ -364,6 +364,20 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
 
             pts, uvs, pns = flat[job.valid], job.uv_self[job.valid], flat_n[job.valid]
 
+            # --- reachable surface: keep every stroke on surface it can reach -
+            # Which triangle each texel lies on, and which triangles each stroke can reach
+            # across the mesh (core/reach.py). Both resolvers take the same tables, so they
+            # agree on what a stroke may paint. The texel map depends on mesh + resolution
+            # only; the reach tables on the seeds plus Stroke Size / Size Variation.
+            with self.stages("reach"):
+                mesh = seeds["_mesh"]
+                tri_map = seed_cache.tri_map_for(sig, lambda: reach.raster_tri_ids(
+                    mesh["uvP"], mesh["uvQ"], mesh["uvR"], mesh["P"], mesh["Q"], mesh["R"],
+                    H, W, pos_map=flat, valid=job.valid, margin=pos_bridge.BAKE_MARGIN))
+                rs = seed_cache.reach_for(
+                    ckey, self.cfg, lambda: reach.build_for_seeds(seeds, self.cfg))
+            tri = tri_map[job.valid]
+
             def cpu_gen():
                 return baker.resolve_uv(
                     pts, uvs,
@@ -371,7 +385,8 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
                     seeds["UVMap"].astype(np.float32), seed_r,
                     seeds["normal"].astype(np.float32),
                     None, self.mask, self.cfg, seed_tan, stamp_rot,
-                    pt_nrm=pns)
+                    pt_nrm=pns, pt_tri=tri,
+                    stroke_reach=(rs["stroke_start"], rs["stroke_tris"]))
 
             # Both resolvers take the same texels and return the same tuple, so nothing
             # before or after this line knows which one ran -- the position maps, valid
@@ -379,7 +394,7 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
             if self.device == 'GPU':
                 def gpu_gen():
                     return gpu_resolve.resolve(pts, uvs, pns, seeds, seed_tan,
-                                               self.mask, self.cfg)
+                                               self.mask, self.cfg, tri, rs)
                 job.device = 'GPU'
                 job.gen = self._gpu_or_cpu(job, gpu_gen, cpu_gen)
             else:

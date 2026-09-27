@@ -48,12 +48,6 @@ with a winner index (>= 0) or -1, so a -2 surviving where a thread should have r
 the dispatch did not run -- a GPU that is 'bugging out' silently. Without this, a dead
 dispatch could read back as zeros, i.e. 'stroke 0 wins everywhere', and ship a broken map."""
 
-GRID_MAX_DIM = 128
-"""Grid cells per axis for the bake. Finer than the preview's 48 -- the bake uploads once
-per object rather than on every slider tick, so it can afford the bigger grid in exchange
-for shorter per-texel candidate loops. The grid never changes the answer, only the speed."""
-
-
 class GPUResolveError(RuntimeError):
     """The GPU produced something that cannot be trusted; the caller falls back to CPU."""
 
@@ -65,9 +59,9 @@ void main()
     if (p.x >= CHUNK_W) return;
     int i = p.x + p.y * CHUNK_W;
     if (i >= u_misc.w) return;               /* padding past this chunk: keep sentinel */
-    vec3 pos = texelFetch(u_pts, p, 0).xyz;
+    vec4 pt = texelFetch(u_pts, p, 0);          /* position .xyz, triangle id .w */
     vec3 nrm = texelFetch(u_pnrm, p, 0).xyz;
-    imageStore(u_out, p, vec4(float(find_stroke(pos, nrm))));
+    imageStore(u_out, p, vec4(float(find_stroke(pt.xyz, nrm, int(pt.w)))));
 }
 """.replace("CHUNK_W", str(CHUNK_W)))
 
@@ -81,13 +75,16 @@ def chunks(m, size=CHUNK):
     return [(a, min(a + size, m)) for a in range(0, m, size)]
 
 
-def pack_chunk(xyz, width=CHUNK_W):
+def pack_chunk(xyz, w=None, width=CHUNK_W):
     """(m, 3) floats -> (h, width, 4) float32, element i at row i // width, col i % width.
-    The fourth channel and the padding past m are zero; the shader never reads padding."""
+    The fourth channel carries `w` when given (the texel's triangle id -- exact as a float
+    below 2**24) and is zero otherwise; padding past m is zero and never read."""
     m = len(xyz)
     h = max(int(np.ceil(m / float(width))), 1)
     out = np.zeros((h * width, 4), np.float32)
     out[:m, :3] = xyz
+    if w is not None:
+        out[:m, 3] = w
     return out.reshape(h, width, 4)
 
 
@@ -142,9 +139,9 @@ def make_compute_shader():
     one R32F image of winner indices out."""
     import gpu
     info = gpu.types.GPUShaderCreateInfo()
-    info.push_constant('VEC4', "u_grid_lo")      # grid origin .xyz, cos(Stroke Cutoff)
-    info.push_constant('VEC4', "u_grid_inv")     # 1 / cell size .xyz
-    info.push_constant('IVEC4', "u_dim_n")       # grid dims .xyz, stroke count
+    info.push_constant('VEC4', "u_grid_lo")      # .w: cos(Stroke Cutoff)
+    info.push_constant('VEC4', "u_grid_inv")     # unused here (preview: depth offset)
+    info.push_constant('IVEC4', "u_dim_n")       # triangle count, -, -, stroke count
     info.push_constant('IVEC4', "u_misc")        # list width, cell width, atlas cols, n
     info.sampler(0, 'FLOAT_2D', "u_stroke")
     info.sampler(1, 'FLOAT_2D', "u_cell")
@@ -166,14 +163,20 @@ def _texture(arr, fmt, channels):
         data=gpu.types.Buffer('FLOAT', w * h * channels, np.ascontiguousarray(arr).ravel()))
 
 
-def resolve(points, uv_self, pt_nrm, seeds, seed_tan, masks, cfg):
+def resolve(points, uv_self, pt_nrm, seeds, seed_tan, masks, cfg, pt_tri, rs):
     """GENERATOR with baker.resolve_uv's contract: yields progress 0..1 after each chunk,
     returns (uv_out, dbg_out, covered, lum_out) via StopIteration.value.
 
-    `points`, `uv_self`, `pt_nrm` are the VALID texels only, exactly as ops/bake.py passes
-    them to resolve_uv. Raises GPUResolveError (or whatever the GPU API raises) on any
-    failure; the caller treats every exception as "fall back to the CPU resolver".
+    `points`, `uv_self`, `pt_nrm`, `pt_tri` are the VALID texels only, exactly as
+    ops/bake.py passes them to resolve_uv; `rs` is core/reach.build()'s result, the same
+    reach tables the CPU resolver filters with. Raises GPUResolveError (or whatever the GPU
+    API raises) on any failure; the caller treats every exception as "fall back to the CPU
+    resolver".
     """
+    if len(pt_tri) != len(points):
+        raise GPUResolveError("texel triangle ids do not match the texels")
+    if rs["n_tris"] >= 1 << 24:
+        raise GPUResolveError("more triangles than a float texel can index exactly")
     import gpu
     from . import livepreview
     from .bridge.brushes import BRUSH_MAX_PX
@@ -185,15 +188,14 @@ def resolve(points, uv_self, pt_nrm, seeds, seed_tan, masks, cfg):
     cos_cut = float(np.cos(np.radians(cfg.crease_angle_deg))) if guard else -2.0
     nrm_in = pt_nrm if pt_nrm is not None else np.zeros((M, 3), np.float32)
 
-    up = livepreview.upload_strokes(masks, cfg, seeds, seed_tan,
-                                    max_dim=GRID_MAX_DIM, atlas_tile=BRUSH_MAX_PX)
+    up = livepreview.upload_strokes(masks, cfg, seeds, seed_tan, rs,
+                                    atlas_tile=BRUSH_MAX_PX)
     shader = make_compute_shader()
-    lo, inv, dim = up["grid_lo"], up["grid_inv"], up["grid_dim"]
 
     idx = np.empty(M, np.int64)
     for a, b in chunks(M):
         m = b - a
-        pts = pack_chunk(points[a:b])
+        pts = pack_chunk(points[a:b], pt_tri[a:b])
         h = pts.shape[0]
         pts_tex = _texture(pts, 'RGBA32F', 4)
         nrm_tex = _texture(pack_chunk(nrm_in[a:b]), 'RGBA32F', 4)
@@ -204,9 +206,9 @@ def resolve(points, uv_self, pt_nrm, seeds, seed_tan, masks, cfg):
         shader.uniform_sampler("u_pts", pts_tex)
         shader.uniform_sampler("u_pnrm", nrm_tex)
         shader.image("u_out", out_tex)
-        shader.uniform_float("u_grid_lo", (float(lo[0]), float(lo[1]), float(lo[2]), cos_cut))
-        shader.uniform_float("u_grid_inv", (float(inv[0]), float(inv[1]), float(inv[2]), 0.0))
-        shader.uniform_int("u_dim_n", (int(dim[0]), int(dim[1]), int(dim[2]), int(up["n"])))
+        shader.uniform_float("u_grid_lo", (0.0, 0.0, 0.0, cos_cut))
+        shader.uniform_float("u_grid_inv", (0.0, 0.0, 0.0, 0.0))
+        shader.uniform_int("u_dim_n", (int(up["n_tris"]), 0, 0, int(up["n"])))
         shader.uniform_int("u_misc", (int(up["list_w"]), int(up["cell_w"]), int(up["cols"]), m))
         gpu.compute.dispatch(shader, CHUNK_W // 16, (h + 15) // 16, 1)
 

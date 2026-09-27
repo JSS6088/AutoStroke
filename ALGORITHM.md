@@ -225,6 +225,7 @@ still sorted. There is no per-tile sort and none is needed.
 | sphere | `d·d < r²` | bounds the normal direction (§2.5) |
 | project | `lu = d·T`, `lv = d·B` | 3D → stroke-local 2D |
 | footprint | `lu, lv` in the painted box, and `~done` | the tight rectangular bound |
+| reach | the texel's triangle is in the stroke's reach set | only surface reachable across the mesh (§2.10) |
 | brush | `sample_mask(...) > thresh` | the silhouette itself |
 | crease | `dot(texel_normal, stroke_normal) > cos θ` | reject strokes reaching around a fold |
 
@@ -339,14 +340,86 @@ A **per-texel gather**: bin strokes spatially, and for each texel test only its 
   `(texel, rank)`, take the first passing pair per texel. That materialises `M·k` pairs, so
   it needs blocking.
 
-The trigger is 8K maps or ~100,000 strokes.
+The trigger is 8K maps or ~100,000 strokes. (The GPU bake, Part 3, is this per-texel
+gather.)
+
+## 2.10 Reachable surface
+
+**The bug.** Every test above is measured in 3D or in the stroke's own plane. None of them
+knows which *surface* a stroke was placed on:
+- the sphere test is distance only;
+- the painted box and brush mask are measured in the stroke's plane;
+- the crease test passes whenever the normals agree.
+
+So a stroke painted any nearby surface facing the same way: a second layer a few mm away, a
+panel floating over a hull, an eyeball in its socket, the far side of a fold. The normal
+map mostly hid it, because the stolen normal is nearly right. The indirection map did not:
+colour read through the pointer came from the wrong part. Measured at 1K, texels won by a
+stroke on a *different connected part* of the mesh:
+
+| object | without reach | with reach |
+|---|---|---|
+| two planes 2 mm apart (one mesh) | 498,807 of 997,724 | **0** |
+| Suzanne (eyes in sockets) | 9,921 of 791,712 | **0** |
+| Body | 16,913 of 760,143 | **0** |
+
+**The rule.** A stroke may paint only triangles it can reach **across the surface**:
+triangles inside its sphere that connect back to its own triangle through triangles also
+inside the sphere. Stacked layers are both inside the sphere but share no path. The two
+sides of a fold connect only around the fold, which lies outside the sphere. No threshold is
+involved. Distance-off-plane, UV-distance and curvature-fit tests were considered and
+rejected: each needs a tolerance and fails when the gap between surfaces is smaller than it,
+and UV distance cuts every stroke at every UV seam.
+
+**Welded by position.** Triangles are neighbours if they share a vertex *position*, not a
+vertex index. Imported meshes routinely split vertices along UV seams and hard edges;
+joining by index would cut the surface into its UV islands and stop strokes at every seam.
+Neighbours share any welded vertex, not just an edge, so fans and T-junctions stay one
+surface. `tri_adjacency` builds the CSR with the repeat/offset trick.
+
+**The flood fill** runs for all strokes at once. Each ring expands the frontier of
+`(stroke, triangle)` pairs to their neighbours, keeps those whose **exact** closest point is
+inside the stroke's sphere (Ericson's closest-point-on-triangle, vectorised), and drops pairs
+already visited. Exact rather than a centroid-plus-circumradius bound: on a low-poly mesh the
+slack of a big triangle can bridge a fold. The sphere is `baker.effective_radius`, the same
+radius the search paints with, so the reach sets can never be sized differently from it.
+`test_reach` proves the vectorised fill equals a plain per-stroke BFS, pair for pair.
+
+**Which triangle a texel is on.** The mesh's UV triangles are rasterised at the bake
+resolution, once per mesh and resolution. Where UVs overlap, the triangle whose interpolated
+3D position matches the baked position wins, so the answer agrees with what Cycles baked.
+Cycles' bake margin marks texels outside every triangle as valid; they take a neighbour's
+triangle, grown by 4-neighbour steps. That takes `2 × margin` passes, not `margin`: one
+4-neighbour step per pass reaches only half as far diagonally, and measured on Suzanne the
+single-margin version left 10,932 margin texels with no triangle.
+
+**Cost**, measured at 1K with 3,500 strokes:
+
+| object | triangles | reach pairs | build | texel map |
+|---|---|---|---|---|
+| stacked planes | 2,304 | 101,566 | 0.07 s | 0.35 s |
+| Suzanne | 968 | 92,505 | 0.07 s | 0.27 s |
+| Body | 4,146 | 246,280 | 0.18 s | 0.25 s |
+
+Both are cached: the texel map per mesh and resolution, the reach sets per seed set, Stroke
+Size and Size Variation. Rotation, jitter, cutoff and brush changes rebuild neither. On the
+CPU the reach test is one sorted-membership check per candidate, before the mask sample: a
+few percent on resolve.
+
+**Coverage.** Texels only other parts' strokes used to reach now fall back to the true
+surface normal, as any uncovered texel does: Body 89.2% covered where it was 90.7%.
+
+**Limit.** Parts that intersect without sharing vertices, such as an arm modelled into a
+torso, are separate surfaces: strokes stop where they cross. Merging them (Merge by
+Distance, a boolean union) makes them one surface.
 
 ---
 
 # Part 3 — The GPU search: preview and bake
 
-The same search, run on the GPU. One GLSL function, `find_stroke(p, n)` in `shaders.py`,
-does it: cell lookup → candidate loop → sphere, box, brush-mask and crease tests → winner.
+The same search, run on the GPU. One GLSL function, `find_stroke(p, n, tri)` in
+`shaders.py`, does it: the strokes that can reach the point's triangle (§2.10) → sphere,
+box, brush-mask and crease tests → winner.
 Two shaders include that text verbatim: the preview's fragment shader and the bake's compute
 shader. The artist therefore judges the same code that ships.
 
@@ -355,9 +428,9 @@ shader. The artist therefore judges the same code that ships.
 A fragment shader, so parameter changes are interactive. It produces no map at all:
 
 ```
-fragment → object-space position + normal (varyings; no baked maps needed)
-         → look up its cell in a uniform 3D grid of strokes
-         → loop that cell, running the same tests as Part 2
+fragment → object-space position + normal + its triangle (varyings; no baked maps)
+         → the strokes that can reach that triangle (§2.10)
+         → loop them, running the same tests as Part 2
          → keep the SMALLEST passing stroke, shade with its normal
 ```
 
@@ -366,19 +439,18 @@ inspected at full size, so coarse texels degrade exactly what is being judged. R
 a texture and reading it back is also out — `img.pixels.foreach_set` costs ~0.3 s of Python
 for 4M floats, enough to defeat "live" on its own.
 
-**Binning.** Strokes are inserted into **every cell their §2.5 box overlaps**, so a fragment
-reads only its own cell, which already holds every stroke that could reach it. A 3×3×3
-neighbourhood query would be 27× the shader work for nothing.
+**Candidates per triangle.** Each triangle carries the list of strokes that can reach it,
+straight from the reach sets. The list is complete by construction, so a fragment reads only
+its own triangle's list. It is also the rule itself: a stroke outside it may not paint there.
+Each corner of the unindexed preview batch carries its loop-triangle index as a flat
+varying, the same index the reach sets use.
 
-**Occupancy does not grow with stroke count**, because §1.1–1.3 shrink strokes as it places
-more: measured **67 / 71 / 79** strokes per cell at 1,000 / 4,000 / 20,000 strokes. (A
-fixture holding radius *fixed* while raising the count reported 10,260 and made the approach
-look hopeless — worth knowing before trusting any measurement here.)
-
-**Grid construction is vectorised.** Looping over strokes in Python cost 262 ms at 20,000
-strokes, which a slider drag would pay on every tick. The repeat/offset expansion — compute
-each stroke's cell span, `repeat` the stroke index by its cell count, then recover each
-cell's `(x,y,z)` from the offset within its run — is 34× faster and produces identical grids.
+This replaced a uniform 3D grid, where a stroke went into every cell its §2.5 box overlapped.
+That grid was complete too (measured 67 / 71 / 79 strokes per cell at 1,000 / 4,000 / 20,000
+strokes), but a cell holds every layer passing through it, which is exactly the bug of
+§2.10. Per-triangle lists hold what reaches that surface. They grow on low-poly meshes, where
+one triangle is large next to the strokes (Suzanne: mean 96, max 227 strokes per triangle;
+Body: 59 and 127). The GPU bake still resolves a 1K map in about 0.06 s there.
 
 ## 3.2 Bake (the default)
 
@@ -390,8 +462,9 @@ exactly `resolve_uv`'s inputs and returns exactly its 4-tuple. The position bake
 gutter, dilation, EXR writing and material build are therefore shared, unchanged.
 
 ```
-once per object   stroke rows, cell table, list, brush atlas   (upload_strokes, as preview)
-per chunk         ≤ 4096×1024 valid texels: position + normal → two RGBA32F textures
+once per object   stroke rows, per-triangle table, list, brush atlas   (upload_strokes)
+per chunk         ≤ 4096×1024 valid texels: position + triangle id (.w), normal
+                  → two RGBA32F textures
                   output R32F texture prefilled with −2
 dispatch          each thread: find_stroke → imageStore(winner index, or −1)
 read back         any −2 left ⇒ the dispatch did not run ⇒ raise
@@ -407,8 +480,8 @@ which texels receive index `j`.
 
 **The CPU and GPU run the same algorithm in a different loop order.** Numpy has a fixed
 per-call cost, so the CPU runs stroke-major over Morton tiles (Part 2). The GPU already runs
-one thread per texel, so it runs texel-major with a per-cell gather. The same tests are
-applied to the same candidates.
+one thread per texel, so it runs texel-major, gathering its triangle's candidates. The
+same tests are applied to the same candidates.
 
 **Aligned with the CPU wherever it is cheap:**
 - *Brush mask.* It is sampled with a hand-rolled bilinear over `texelFetch`, using
@@ -418,19 +491,19 @@ applied to the same candidates.
 - *Tie-break.* An exact radius tie goes to the higher index, as in `resolve_uv`. The preview
   gets this too, because the function is shared.
 
-**Measured** on the same cached maps at 1K, winner index per texel:
+**Measured** on the same cached maps at 1K, winner index per texel, with reach (§2.10):
 
 | object | same winner | CPU resolve | GPU resolve |
 |---|---|---|---|
-| Body | 803,563 / 803,564 | 3.71 s | 0.086 s |
-| Suzanne | 814,101 / 814,102 | — | — |
-| bunny, Cube | all | — | — |
+| Body | 747,095 / 747,095 | 2.81 s | 0.061 s |
+| Suzanne | 789,855 / 789,855 | 2.86 s | 0.066 s |
+| stacked planes | 925,459 / 925,459 | 1.94 s | 0.129 s |
 
-Through the real operator on a two-object batch (Body + Suzanne), a whole bake took 1.9 s
-on the GPU against 9.0 s on the CPU. The written maps differ in 13 and 1 texels of 1,048,576.
-The remaining differences are float32 against float64 at a brush silhouette or crease
-threshold. That is fine for a visual output, and the result can vary slightly between
-graphics drivers.
+Through the real operator on a two-object batch (Body + Suzanne), a whole bake took 2.1 s
+on the GPU against 8.1 s on the CPU, and the written maps were identical, texel for texel.
+Before reach, the same batch differed in 13 and 1 texels of 1,048,576: float32 against
+float64 at a brush silhouette or crease threshold. Such differences can still appear on
+other meshes and graphics drivers; for a visual output that is fine.
 
 **Limits.** No texture is wider than 4096 or taller than 1024. Metal caps textures at 16384
 and treats exceeding it as a hard process abort, not a catchable error. Python's API has no

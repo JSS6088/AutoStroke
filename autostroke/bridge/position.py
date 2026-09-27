@@ -228,7 +228,13 @@ def ensure_image(res, channel="position"):
     return img
 
 
-def bake(obj, res, margin=16, channel="position"):
+BAKE_MARGIN = 16
+"""Pixels Cycles extends each UV island by. Those margin texels read as valid in the
+position map but lie outside every triangle, so core/reach.raster_tri_ids grows triangle
+ids over the same distance."""
+
+
+def bake(obj, res, margin=BAKE_MARGIN, channel="position"):
     """Bake an object-space channel, returned as a TOP-DOWN (res,res,3) array.
 
     channel="position" gives the UV->3D bridge the baker needs; "normal" gives the true
