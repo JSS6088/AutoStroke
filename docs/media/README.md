@@ -6,7 +6,7 @@ page (`JSS6088.github.io/projects/autostroke/`). Record or render each asset onc
 
 | File | Made by |
 |---|---|
-| `body_before.png`, `body_after.png` | `tools/render_showcase.py`: a fresh bake of Body, then EEVEE renders |
+| `suzanne_before.png`, `suzanne_after.png` | `tools/render_showcase.py`: a fresh bake of Suzanne, then EEVEE renders |
 | `hero.jpg`, `social_preview.jpg` | `tools/encode_media.sh`, cropped from the renders |
 | `live_preview.gif` | `tools/encode_media.sh <recording>`, from your screen recording |
 | `panel.png` | `tools/encode_media.sh <recording> <screenshot>`, from your screenshot |
@@ -18,17 +18,21 @@ and the `card:` line in `_data/projects.yml`.
 ## Re-rendering the stills
 
 ```bash
-"$BLENDER" --factory-startup PainterlyTexture.blend --python tools/render_showcase.py -- docs/media Body
+"$BLENDER" --factory-startup PainterlyTexture.blend --python tools/render_showcase.py \
+    -- docs/media "Suzanne@-0.7,-1,-0.2" sun=2 world=0.7
 tools/encode_media.sh
 ```
 
-The script bakes into a temporary folder and never saves the `.blend`. If you change the
-camera, re-tune the crop offsets at the top of `encode_media.sh`.
+The script bakes into a temporary folder and never saves the `.blend`.
+- The view is front, slightly left and below.
+- The sun is doubled and the world light dimmed, so the render has a strong light-to-shadow
+  range where the strokes read clearly.
+- `HERO=<name> tools/encode_media.sh` encodes a different object's renders.
 
 ## Recording checklist
 
 **Showcase clip.** One recording becomes both the README GIF and the portfolio's mp4:
-- 3D viewport around 1600×900, sidebar open on the AutoStroke tab, Body selected.
+- 3D viewport around 1600×900, sidebar open on the AutoStroke tab, Suzanne selected.
 - 8–12 seconds:
   1. Live Preview ON.
   2. Drag **Stroke Count**.

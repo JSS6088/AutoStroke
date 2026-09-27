@@ -4,7 +4,8 @@
 #
 #   tools/encode_media.sh [recording.mov] [panel_screenshot.png]
 #
-# Always (from docs/media/body_before.png + body_after.png, made by render_showcase.py):
+# Always (from docs/media/$HERO_before.png + $HERO_after.png, made by render_showcase.py;
+# HERO defaults to suzanne):
 #   docs/media/hero.jpg               before | after side by side, for the README
 #   docs/media/social_preview.jpg     1280x640, for GitHub's repo social preview
 #   docs/media/portfolio/images/AutoStroke/AutoStroke_painterly_off.png, _on.png
@@ -29,23 +30,26 @@ PANEL="${2:-}"
 FF=(ffmpeg -hide_banner -loglevel error -y)
 
 command -v ffmpeg >/dev/null || { echo "error: ffmpeg not found" >&2; exit 1; }
-for f in body_before.png body_after.png; do
+HERO="${HERO:-suzanne}"
+BEFORE="$MEDIA/${HERO}_before.png"
+AFTER="$MEDIA/${HERO}_after.png"
+for f in "${HERO}_before.png" "${HERO}_after.png"; do
     [ -f "$MEDIA/$f" ] || { echo "error: $MEDIA/$f missing -- run tools/render_showcase.py" >&2; exit 1; }
 done
 mkdir -p "$PORT_IMG" "$PORT_VID"
 
-# Stills. Crops are tuned to where Body sits in render_showcase.py's 1600x900 framing
-# (roughly x 380-1200, y 190-860); re-tune them if you re-render with another camera.
-OBJ_CROP="crop=840:680:370:185"
-"${FF[@]}" -i "$MEDIA/body_before.png" -i "$MEDIA/body_after.png" \
-    -filter_complex "[0]$OBJ_CROP[a];[1]$OBJ_CROP[b];[a][b]hstack=inputs=2" -q:v 2 \
-    "$MEDIA/hero.jpg"
-"${FF[@]}" -i "$MEDIA/body_after.png" -vf "crop=1300:650:150:200,scale=1280:640" -q:v 2 \
+# Stills. render_showcase.py frames the object tightly in 1600x900, so the hero crops each
+# frame to its middle 1100 px and the other formats pad or scale the whole frame. BG is the
+# renders' background grey, used to pad the 2:1 social preview without a visible seam.
+BG="0x2f2f2f"
+"${FF[@]}" -i "$BEFORE" -i "$AFTER" \
+    -filter_complex "[0]crop=1100:900[a];[1]crop=1100:900[b];[a][b]hstack=inputs=2,scale=1800:-2" \
+    -q:v 2 "$MEDIA/hero.jpg"
+"${FF[@]}" -i "$AFTER" -vf "scale=-2:640,pad=1280:640:(ow-iw)/2:0:color=$BG" -q:v 2 \
     "$MEDIA/social_preview.jpg"
-"${FF[@]}" -i "$MEDIA/body_after.png" -vf "crop=1120:630:230:210,scale=960:540" -q:v 2 \
-    "$PORT_IMG/AutoStroke_card.jpg"
-cp "$MEDIA/body_before.png" "$PORT_IMG/AutoStroke_painterly_off.png"
-cp "$MEDIA/body_after.png"  "$PORT_IMG/AutoStroke_painterly_on.png"
+"${FF[@]}" -i "$AFTER" -vf "scale=960:540" -q:v 2 "$PORT_IMG/AutoStroke_card.jpg"
+cp "$BEFORE" "$PORT_IMG/AutoStroke_painterly_off.png"
+cp "$AFTER"  "$PORT_IMG/AutoStroke_painterly_on.png"
 
 if [ -n "$REC" ]; then
     # mp4: H.264, no audio, yuv420p for Safari, faststart so it plays while loading.
@@ -65,4 +69,4 @@ fi
 
 echo "wrote:"
 find "$MEDIA" -type f \( -name '*.jpg' -o -name '*.png' -o -name '*.gif' -o -name '*.mp4' \) \
-    -newer "$MEDIA/body_after.png" -exec ls -lh {} \; | awk '{print "  " $5 "\t" $NF}'
+    -newer "$AFTER" -exec ls -lh {} \; | awk '{print "  " $5 "\t" $NF}'

@@ -6,15 +6,23 @@ never saves the .blend: every change (visibility, modifiers, materials, cameras)
 memory only, and the bake writes its maps into a temporary folder, not Output/.
 
     Blender --factory-startup PainterlyTexture.blend --python tools/render_showcase.py \
-            -- <out_dir> [object ...]
+            -- <out_dir> [object[@dx,dy,dz[,roll]] ...] [sun=K] [world=K]
 
 For each object (default: Body) it writes, with the scene's lights:
   <name>_before.png  the mesh with a neutral grey material (what you start from)
   <name>_after.png   the same mesh with the <name>_AutoStroke material from that bake
 
-Every object is shot with a temporary camera looking the SAME way as the scene camera,
-pulled back to fit the object's bounding sphere, so shots are framed alike. Geometry-nodes
-modifiers are turned off for the render, as the bake itself does.
+Every object is shot with a temporary camera, framed tightly on the object's projected
+vertices. By default it looks the same way as the scene camera. `@dx,dy,dz` instead places the camera
+in that world-space direction from the object's centre, looking back at it (e.g.
+`Suzanne@-0.4,-1,-0.7` is front, a little left and below). An optional 4th value rolls the
+camera, in degrees. Geometry-nodes modifiers are turned off for the render, as the bake
+itself does. `sun=K` and `world=K` scale the sun's energy and the world background's
+strength (in memory), for more light/shadow contrast than the scene's defaults.
+
+The README's images come from:
+
+    ... -- docs/media "Suzanne@-0.7,-1,-0.2" sun=2 world=0.7
 
 --factory-startup keeps any INSTALLED copy of the add-on from loading, so the repo copy can
 register without its classes colliding with the installed ones.
@@ -28,12 +36,16 @@ import time
 import traceback
 
 import bpy
-from mathutils import Vector
+from mathutils import Quaternion, Vector
 
 ARGV = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.abspath(ARGV[0]) if ARGV else os.path.join(REPO, "docs", "media")
-NAMES = ARGV[1:] or ["Body"]
+OPTS = dict(a.split("=", 1) for a in ARGV[1:] if "=" in a)
+SPECS = [a for a in ARGV[1:] if "=" not in a] or ["Body"]
+NAMES = [a.split("@")[0] for a in SPECS]
+VIEWS = {a.split("@")[0]: [float(v) for v in a.split("@")[1].split(",")]
+         for a in SPECS if "@" in a}
 RES = (1600, 900)
 WORK = tempfile.mkdtemp(prefix="autostroke_showcase_")
 lines = []
@@ -84,17 +96,32 @@ def grey_material():
     return mat
 
 
-def camera_for(obj, base):
-    """A copy of the scene camera, same view direction, pulled back to fit obj."""
+def camera_for(obj, base, view=None):
+    """A copy of the scene camera looking along the scene camera's direction, or from
+    `view` = (dx, dy, dz[, roll_deg]) towards the object, framed tightly on the object's
+    vertices as projected onto the image plane (5% margin)."""
     cam = base.copy()
     cam.data = base.data.copy()
     bpy.context.scene.collection.objects.link(cam)
-    corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
-    centre = sum(corners, Vector()) / 8.0
-    radius = max((c - centre).length for c in corners)
-    fwd = (base.matrix_world.to_quaternion() @ Vector((0.0, 0.0, -1.0))).normalized()
-    fov = min(cam.data.angle_x, cam.data.angle_y)
-    cam.location = centre - fwd * (radius / math.sin(fov / 2.0) * 1.02)
+    if view:
+        rot = (-Vector(view[:3])).normalized().to_track_quat('-Z', 'Y')
+        if len(view) > 3:
+            rot = rot @ Quaternion((0.0, 0.0, 1.0), math.radians(view[3]))
+    else:
+        rot = base.matrix_world.to_quaternion()
+    cam.rotation_mode = 'QUATERNION'
+    cam.rotation_quaternion = rot
+    sc = bpy.context.scene
+    cam.data.sensor_fit = 'HORIZONTAL'
+    tx = math.tan(cam.data.angle_x / 2.0)
+    ty = tx * sc.render.resolution_y / sc.render.resolution_x
+    # vertices in the camera's frame (camera looks down -Z); the camera sits at (cx, cy, d)
+    inv, mw = rot.inverted(), obj.matrix_world
+    pts = [inv @ (mw @ v.co) for v in obj.data.vertices]
+    cx = (max(p.x for p in pts) + min(p.x for p in pts)) / 2.0
+    cy = (max(p.y for p in pts) + min(p.y for p in pts)) / 2.0
+    d = max(max(abs(p.x - cx) / tx, abs(p.y - cy) / ty) + p.z for p in pts) * 1.05
+    cam.location = rot @ Vector((cx, cy, d))
     return cam
 
 
@@ -112,7 +139,14 @@ def render_all():
     sc.render.resolution_percentage = 100
     sc.render.image_settings.file_format = 'PNG'
     base, grey = sc.camera, grey_material()
-    log("render: %s, %dx%d" % (sc.render.engine, *RES))
+    k_sun, k_world = float(OPTS.get("sun", 1)), float(OPTS.get("world", 1))
+    for o in bpy.data.objects:
+        if o.type == 'LIGHT':
+            o.data.energy *= k_sun
+    bg = sc.world.node_tree.nodes.get("Background") if sc.world and sc.world.use_nodes else None
+    if bg is not None:
+        bg.inputs["Strength"].default_value *= k_world
+    log("render: %s, %dx%d, sun x%g, world x%g" % (sc.render.engine, *RES, k_sun, k_world))
     for name in NAMES:
         obj = bpy.data.objects[name]
         mat = bpy.data.materials.get(name + "_AutoStroke")
@@ -126,7 +160,7 @@ def render_all():
             if m.type == 'NODES':
                 m.show_render = False
         log("%s:" % name)
-        cam = camera_for(obj, base)
+        cam = camera_for(obj, base, VIEWS.get(name))
         for s in obj.material_slots:
             s.material = grey
         shoot(cam, os.path.join(OUT, "%s_before.png" % name.lower()))
