@@ -6,6 +6,7 @@ point-cloud walk) is gone.
 """
 
 import hashlib
+from contextlib import contextmanager
 
 import numpy as np
 import bpy
@@ -13,6 +14,58 @@ import bpy
 
 class MeshError(RuntimeError):
     """Raised with a message meant for the artist, not the console."""
+
+
+# Modifiers whose viewport result can differ from their render result through a LEVEL
+# rather than a visibility toggle: (viewport attribute, render attribute).
+RENDER_LEVELS = {'SUBSURF': ("levels", "render_levels"),
+                 'MULTIRES': ("levels", "render_levels")}
+
+
+def render_changes(obj):
+    """[(modifier, attribute, render value)] needed to make the viewport evaluate `obj` the
+    way the Cycles bake does. Empty for most meshes, so render_state() is then free.
+
+    Cycles evaluates with RENDER settings: a modifier's show_render, and Subdivision /
+    Multires at render_levels. It also bakes with geometry-nodes modifiers switched off
+    (position.disabled_geometry_nodes). The depsgraph Python can read evaluates with
+    VIEWPORT settings. When the two differ -- a Bevel enabled for render only, Subdivision
+    at 1 in the viewport and 2 for render -- strokes were placed on one mesh while their
+    texels were baked from another, and most strokes were rejected (measured on a staircase
+    with a render-only Bevel: 45% coverage, 88% once both read the same mesh)."""
+    changes = []
+    for m in obj.modifiers:
+        want = False if m.type == 'NODES' else m.show_render
+        if m.show_viewport != want:
+            changes.append((m, "show_viewport", want))
+        if m.type in RENDER_LEVELS and want:
+            vp, rd = RENDER_LEVELS[m.type]
+            if getattr(m, vp) != getattr(m, rd):
+                changes.append((m, vp, getattr(m, rd)))
+    return changes
+
+
+@contextmanager
+def render_state(obj):
+    """Evaluate `obj` as the bake sees it, then put every setting back exactly.
+
+    Everything that reads the mesh -- the signature, the seeds, the live preview's own
+    draw mesh -- goes through this, so strokes, reach sets, the preview and the Cycles
+    position/normal maps all describe the SAME geometry. A no-op when viewport and render
+    already agree."""
+    changes = render_changes(obj)
+    saved = [(m, attr, getattr(m, attr)) for m, attr, _ in changes]
+    try:
+        for m, attr, value in changes:
+            setattr(m, attr, value)
+        if changes:
+            bpy.context.view_layer.update()
+        yield bool(changes)
+    finally:
+        for m, attr, value in reversed(saved):
+            setattr(m, attr, value)
+        if changes:
+            bpy.context.view_layer.update()
 
 
 def signature(obj, extra=""):
@@ -34,6 +87,11 @@ def signature(obj, extra=""):
     """
     if obj is None or obj.type != 'MESH':
         raise MeshError("AutoStroke needs a mesh object")
+    with render_state(obj):
+        return _signature(obj, extra)
+
+
+def _signature(obj, extra):
     deps = bpy.context.evaluated_depsgraph_get()
     ev = obj.evaluated_get(deps)
     me = ev.to_mesh()
@@ -66,7 +124,11 @@ def read_triangles(obj):
     """
     if obj is None or obj.type != 'MESH':
         raise MeshError("AutoStroke needs a mesh object")
+    with render_state(obj):
+        return _read_triangles(obj)
 
+
+def _read_triangles(obj):
     deps = bpy.context.evaluated_depsgraph_get()
     ev = obj.evaluated_get(deps)
     me = ev.to_mesh()

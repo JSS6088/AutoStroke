@@ -51,6 +51,7 @@ class FakeMesh:
 class FakeObj:
     type = 'MESH'
     name = "Fake"
+    modifiers = ()      # viewport == render: mesh.render_state has nothing to switch
 
     def __init__(self, mesh):
         self._mesh = mesh

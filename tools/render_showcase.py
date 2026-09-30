@@ -28,7 +28,6 @@ The README's images come from:
 register without its classes colliding with the installed ones.
 """
 
-import math
 import os
 import sys
 import tempfile
@@ -36,7 +35,9 @@ import time
 import traceback
 
 import bpy
-from mathutils import Quaternion, Vector
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import showcase_lib as lib                      # noqa: E402
 
 ARGV = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -63,66 +64,9 @@ def finish():
     os._exit(0)
 
 
-def view3d():
-    for win in bpy.context.window_manager.windows:
-        for area in win.screen.areas:
-            if area.type == 'VIEW_3D':
-                return win, area, next(r for r in area.regions if r.type == 'WINDOW')
-    raise RuntimeError("no 3D viewport in this window")
-
-
 def start_bake(name):
-    obj = bpy.data.objects[name]
-    obj.hide_set(False)
-    bpy.ops.object.select_all(action='DESELECT')
-    obj.select_set(True)
-    bpy.context.view_layer.objects.active = obj
-    st = bpy.context.scene.autostroke
-    st.working_dir = WORK + os.sep
-    st.bake_device = 'GPU'
-    st.last_report = ""
-    win, area, region = view3d()
-    with bpy.context.temp_override(window=win, area=area, region=region):
-        bpy.ops.autostroke.bake('INVOKE_DEFAULT')
+    lib.start_bake(bpy.data.objects[name], WORK)
     state["current"], state["t"] = name, time.time()
-
-
-def grey_material():
-    mat = bpy.data.materials.new("showcase_grey")
-    mat.use_nodes = True
-    bsdf = next(n for n in mat.node_tree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled")
-    bsdf.inputs["Base Color"].default_value = (0.8, 0.8, 0.8, 1.0)
-    bsdf.inputs["Roughness"].default_value = 0.6
-    return mat
-
-
-def camera_for(obj, base, view=None):
-    """A copy of the scene camera looking along the scene camera's direction, or from
-    `view` = (dx, dy, dz[, roll_deg]) towards the object, framed tightly on the object's
-    vertices as projected onto the image plane (5% margin)."""
-    cam = base.copy()
-    cam.data = base.data.copy()
-    bpy.context.scene.collection.objects.link(cam)
-    if view:
-        rot = (-Vector(view[:3])).normalized().to_track_quat('-Z', 'Y')
-        if len(view) > 3:
-            rot = rot @ Quaternion((0.0, 0.0, 1.0), math.radians(view[3]))
-    else:
-        rot = base.matrix_world.to_quaternion()
-    cam.rotation_mode = 'QUATERNION'
-    cam.rotation_quaternion = rot
-    sc = bpy.context.scene
-    cam.data.sensor_fit = 'HORIZONTAL'
-    tx = math.tan(cam.data.angle_x / 2.0)
-    ty = tx * sc.render.resolution_y / sc.render.resolution_x
-    # vertices in the camera's frame (camera looks down -Z); the camera sits at (cx, cy, d)
-    inv, mw = rot.inverted(), obj.matrix_world
-    pts = [inv @ (mw @ v.co) for v in obj.data.vertices]
-    cx = (max(p.x for p in pts) + min(p.x for p in pts)) / 2.0
-    cy = (max(p.y for p in pts) + min(p.y for p in pts)) / 2.0
-    d = max(max(abs(p.x - cx) / tx, abs(p.y - cy) / ty) + p.z for p in pts) * 1.05
-    cam.location = rot @ Vector((cx, cy, d))
-    return cam
 
 
 def shoot(cam, path):
@@ -138,7 +82,7 @@ def render_all():
     sc.render.resolution_x, sc.render.resolution_y = RES
     sc.render.resolution_percentage = 100
     sc.render.image_settings.file_format = 'PNG'
-    base, grey = sc.camera, grey_material()
+    base, grey = sc.camera, lib.grey_material()
     k_sun, k_world = float(OPTS.get("sun", 1)), float(OPTS.get("world", 1))
     for o in bpy.data.objects:
         if o.type == 'LIGHT':
@@ -160,7 +104,7 @@ def render_all():
             if m.type == 'NODES':
                 m.show_render = False
         log("%s:" % name)
-        cam = camera_for(obj, base, VIEWS.get(name))
+        cam = lib.camera_for(obj, base, VIEWS.get(name))
         for s in obj.material_slots:
             s.material = grey
         shoot(cam, os.path.join(OUT, "%s_before.png" % name.lower()))

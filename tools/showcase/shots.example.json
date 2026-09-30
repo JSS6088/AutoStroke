@@ -1,0 +1,20 @@
+{
+  "_readme": [
+    "Copy this file to shots.json (git-ignored) and point each entry at a model file.",
+    "file: .glb .gltf .fbx .obj or .blend; object: one object's name, or null for all of them (joined).",
+    "strokes: Stroke Count. stroke_size: optional, else the scene default (4).",
+    "brush: a shipped set (standard, rough) or a folder of brush images. brushes: extra sets, rendered as brush_<set> shots.",
+    "view: camera direction from the model's centre, e.g. [-0.7, -1, -0.2] = front, a little left and below.",
+    "albedo: auto = the image feeding Principled Base Color; a path = that image; null = grey.",
+    "hero: true renders a before->after wipe in encode_hero.sh."
+  ],
+  "models": [
+    { "name": "knight", "file": "~/Showcase/knight.glb", "object": null, "kind": "organic",
+      "strokes": 6000, "brush": "standard", "view": [-0.7, -1, -0.2],
+      "albedo": "auto", "hero": true, "brushes": ["rough"] },
+    { "name": "crate", "file": "~/Showcase/crate.fbx", "object": null, "kind": "hard surface",
+      "strokes": 4000, "brush": "rough", "view": [-1, -1, -0.5], "albedo": "auto" },
+    { "name": "suzanne", "file": "PainterlyTexture.blend", "object": "Suzanne", "kind": "stylised",
+      "strokes": 3500, "brush": "standard", "view": [-0.7, -1, -0.2], "albedo": null }
+  ]
+}

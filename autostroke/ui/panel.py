@@ -215,6 +215,7 @@ class AUTOSTROKE_PT_main(bpy.types.Panel):
                 layout.label(text=line)
         row = layout.row(align=True)
         row.operator("autostroke.build_material", icon='MATERIAL')
+        row.operator("autostroke.remove_material", text="", icon='LOOP_BACK')
         row.operator("autostroke.open_folder", icon='FILE_FOLDER')
 
 

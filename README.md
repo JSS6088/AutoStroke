@@ -45,7 +45,7 @@ Blender 5.0+ · GPL-3.0-or-later
 
 ## Install
 
-1. Download [`autostroke-0.13.0.zip`](autostroke-0.13.0.zip).
+1. Download [`autostroke-0.13.1.zip`](autostroke-0.13.1.zip).
 2. In Blender 5.0 or later: **Edit → Preferences → Get Extensions**, then the **▾** menu
    at the top right → **Install from Disk…**, and pick the zip.
 
@@ -56,7 +56,8 @@ Blender 5.0+ · GPL-3.0-or-later
 3. Set **Stroke Count** and pick a **Brush Set**.
 4. Turn on **Live Preview** and adjust until it looks right.
 5. Press **BAKE**. The maps go to **Working Dir** (default `//AutoStroke/`, next to the
-   saved `.blend`), and the material is built and assigned.
+   saved `.blend`), and the strokes are added to every material on the object: each gets
+   its own copy, so the originals stay untouched. **Remove Strokes** puts them back.
 
 <!-- panel screenshot: docs/media/panel.png (see docs/media/README.md), then uncomment:
 <img src="docs/media/panel.png" alt="The AutoStroke panel" width="320">
@@ -89,7 +90,8 @@ Blender 5.0+ · GPL-3.0-or-later
 3. **Output.**
    - The winner's normal goes into the stroke normal map, and its UV pointer and tone into
      the indirection map.
-   - Gaps are dilated, and a material is built that reads both maps.
+   - Gaps are dilated. Every material on the object gets a copy with the stroke normal
+     and per-stroke tone wired in; its own colour and roughness are kept.
 
 
 ## Future direction - detail normal map

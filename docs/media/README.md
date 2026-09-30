@@ -49,3 +49,73 @@ The script bakes into a temporary folder and never saves the `.blend`.
 **Size targets:**
 - GIF ≤ 8 MB. If it's over, shorten the clip or drop to 10 fps in the script.
 - Each still ≤ 1 MB.
+
+## Hero video
+
+A 25–30 s showcase for the portfolio page, the README and LinkedIn. It's built from raw
+shots that the scripts render and you cut to music in your own editor.
+
+**Shot list:**
+
+| Time | Shot | Source |
+|---|---|---|
+| 0–3 s | Hook: the hero model turning, wiped from plain to painterly | `wipe.mov` |
+| 3–12 s | Montage, ~1.5 s per model on the beat: organic, hard surface, stylised | `after.mov` per model |
+| 12–17 s | One model, a different brush set on each beat | `brush_<set>.mov` |
+| 17–23 s | Live preview: viewport + panel, dragging Stroke Size and Rotation | your screen recording |
+| 23–27 s | Fast bake: select several models, one Bake, the report's time on screen | your screen recording |
+| 27–30 s | End card: name, "AutoStroke · painterly texturing for Blender", link | your editor |
+
+Cut two versions from the same shots:
+- **16:9, 12–15 s, looping, no end card:** the portfolio's `AutoStroke_Showcase.mp4` slot
+  and the README GIF.
+- **4:5, 25–30 s, with the end card:** LinkedIn.
+
+**1. List your models.**
+- Copy `tools/showcase/shots.example.json` to `tools/showcase/shots.json`, which is
+  git-ignored, and point it at 5–8 models with UVs.
+- Aim for a mix of organic, hard surface, and at least one with an albedo texture for
+  colour shots.
+- Relative paths resolve from the folder you run Blender in.
+
+**2. Check, then render:**
+
+```bash
+"$BLENDER" --factory-startup --python tools/render_hero.py -- ~/HeroShots --check
+"$BLENDER" --factory-startup --python tools/render_hero.py -- ~/HeroShots
+```
+
+- `--check` imports each model and validates it (file, UVs, albedo, brush sets) without
+  rendering.
+- A full run bakes each model with the real Bake (GPU) at 2K and renders 5 s looping
+  turntables with a transparent background, in **16:9 (1920×1080) and 4:5 (1080×1350)**.
+- The lights are fixed while the model turns, so strokes catch the light.
+- `--only a,b`, `--aspect 16x9` and `--frames 30` are for quick tests.
+- Nothing is saved to any `.blend`.
+- Bake times per model go to `~/HeroShots/report.json`. Use these for the fast-bake shot.
+
+**3. Encode:**
+
+```bash
+tools/encode_hero.sh ~/HeroShots
+```
+
+Per model and aspect this writes:
+
+| File | Use |
+|---|---|
+| `<shot>.mov` | ProRes 4444 with alpha, for editing; put any background under it |
+| `<shot>_preview.mp4` | quick look on grey |
+| `wipe.mov` | before → after for models with `"hero": true` |
+| `contact.jpg` | first, middle and last frame of every shot, to check before you edit |
+
+Each model's shots are `before` and `after`, plus `brush_<set>` if you listed extra sets.
+"After" breaks the model's albedo into flat per-stroke colour, or shows the grey stroke
+material if the model has no albedo.
+
+**Screen recordings** (for the live-preview and fast-bake shots):
+- Record the viewport and sidebar at 1920×1080. For the 4:5 cut, you'll crop around the
+  model and the panel.
+- Slow slider drags.
+- For the bake shot, select several models, press Bake once, and hold on the report line
+  showing the time.

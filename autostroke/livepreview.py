@@ -345,43 +345,46 @@ def _build(context, obj):
     rs = seed_cache.reach_for(ckey, cfg, lambda: reach.build_for_seeds(seeds, cfg))
     up = upload_strokes(masks, cfg, seeds, tan, rs)
 
-    me = obj.evaluated_get(context.evaluated_depsgraph_get()).to_mesh()
-    try:
-        me.calc_loop_triangles()
-        nv, nt = len(me.vertices), len(me.loop_triangles)
-        co = np.empty(nv * 3, np.float32); me.vertices.foreach_get("co", co)
-        co = co.reshape(-1, 3)
-        tri_v = np.empty(nt * 3, np.int32)
-        me.loop_triangles.foreach_get("vertices", tri_v)
-        tri_v = tri_v.reshape(-1, 3)
-
-        # SHADING normals, per loop corner -- the same source bridge/mesh.py hands the
-        # baker. Per-VERTEX normals are always smooth-averaged, so across a sharp edge,
-        # custom split normals or Auto Smooth they disagree with what the bake sees. This
-        # normal is the crease test's input (dot(n, SN) > cos_cut), so using the smoothed
-        # one made the preview stop strokes in different places than the bake, everywhere
-        # the mesh has a hard edge.
-        #
-        # One vertex can carry several corner normals, so the buffer cannot stay indexed
-        # by vertex: expand to three unshared corners per triangle. That costs 3x the
-        # vertex memory (~7 MB at 100k triangles) and is why the batch is unindexed.
+    # The mesh as the bake sees it (render settings), the same one the seeds and the reach
+    # tables were built from -- see mesh_bridge.render_state.
+    with mesh_bridge.render_state(obj):
+        me = obj.evaluated_get(context.evaluated_depsgraph_get()).to_mesh()
         try:
-            corner_n = np.empty(len(me.loops) * 3, np.float32)
-            me.corner_normals.foreach_get("vector", corner_n)
-            tri_l = np.empty(nt * 3, np.int32)
-            me.loop_triangles.foreach_get("loops", tri_l)
-            vnrm = corner_n.reshape(-1, 3)[tri_l.reshape(-1, 3)].reshape(-1, 3)
-        except (AttributeError, RuntimeError, ValueError):
-            vn = np.empty(nv * 3, np.float32)        # older build: smoothed, as before
-            me.vertices.foreach_get("normal", vn)
-            vnrm = vn.reshape(-1, 3)[tri_v].reshape(-1, 3)
-        vpos = co[tri_v].reshape(-1, 3)
-        # Each corner carries its loop-triangle index, so a fragment knows which triangle
-        # it is on -- the key into the reach lists. Same loop_triangles order as the seeds'
-        # triangles (bridge/mesh.read_triangles), so the index means the same thing.
-        vtri = np.repeat(np.arange(nt, dtype=np.float32), 3)
-    finally:
-        obj.evaluated_get(context.evaluated_depsgraph_get()).to_mesh_clear()
+            me.calc_loop_triangles()
+            nv, nt = len(me.vertices), len(me.loop_triangles)
+            co = np.empty(nv * 3, np.float32); me.vertices.foreach_get("co", co)
+            co = co.reshape(-1, 3)
+            tri_v = np.empty(nt * 3, np.int32)
+            me.loop_triangles.foreach_get("vertices", tri_v)
+            tri_v = tri_v.reshape(-1, 3)
+
+            # SHADING normals, per loop corner -- the same source bridge/mesh.py hands the
+            # baker. Per-VERTEX normals are always smooth-averaged, so across a sharp edge,
+            # custom split normals or Auto Smooth they disagree with what the bake sees. This
+            # normal is the crease test's input (dot(n, SN) > cos_cut), so using the smoothed
+            # one made the preview stop strokes in different places than the bake, everywhere
+            # the mesh has a hard edge.
+            #
+            # One vertex can carry several corner normals, so the buffer cannot stay indexed
+            # by vertex: expand to three unshared corners per triangle. That costs 3x the
+            # vertex memory (~7 MB at 100k triangles) and is why the batch is unindexed.
+            try:
+                corner_n = np.empty(len(me.loops) * 3, np.float32)
+                me.corner_normals.foreach_get("vector", corner_n)
+                tri_l = np.empty(nt * 3, np.int32)
+                me.loop_triangles.foreach_get("loops", tri_l)
+                vnrm = corner_n.reshape(-1, 3)[tri_l.reshape(-1, 3)].reshape(-1, 3)
+            except (AttributeError, RuntimeError, ValueError):
+                vn = np.empty(nv * 3, np.float32)        # older build: smoothed, as before
+                me.vertices.foreach_get("normal", vn)
+                vnrm = vn.reshape(-1, 3)[tri_v].reshape(-1, 3)
+            vpos = co[tri_v].reshape(-1, 3)
+            # Each corner carries its loop-triangle index, so a fragment knows which triangle
+            # it is on -- the key into the reach lists. Same loop_triangles order as the seeds'
+            # triangles (bridge/mesh.read_triangles), so the index means the same thing.
+            vtri = np.repeat(np.arange(nt, dtype=np.float32), 3)
+        finally:
+            obj.evaluated_get(context.evaluated_depsgraph_get()).to_mesh_clear()
 
     from gpu_extras.batch import batch_for_shader
     shader = make_shader()

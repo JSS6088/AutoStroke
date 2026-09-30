@@ -17,3 +17,6 @@ Output/
 # encode_media.sh output laid out for the portfolio repo -- copied there, not kept here
 docs/media/portfolio/
 docs/media/render_report.txt
+
+# local shot list for tools/render_hero.py (holds paths on this machine)
+tools/showcase/shots.json
