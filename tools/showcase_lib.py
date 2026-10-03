@@ -77,6 +77,63 @@ def albedo_of(mat):
     return None
 
 
+def _stroke_nodes(nt, suffix):
+    """Image nodes reading one of AutoStroke's baked maps, found by IMAGE NAME -- not by
+    the node tag, which Blender copies onto any node an artist duplicates from ours."""
+    return [n for n in nt.nodes if n.bl_idname == "ShaderNodeTexImage" and n.image
+            is not None and n.image.name.endswith(suffix)]
+
+
+def without_strokes(mat, grey):
+    """`mat` without AutoStroke, as a temporary copy -- or `mat` itself if it never read
+    AutoStroke's maps. Every node the artist made is kept; only the maps' influence is
+    undone:
+      - textures read THROUGH the indirection pointer (colour, AO, roughness...) go back
+        to the mesh's own UVs: the pointer link into their Vector input is removed;
+      - anything else fed by the indirection map (the per-stroke tone, ramps driven by
+        it) gets a neutral mid value, 0.5, instead of a random per stroke;
+      - the stroke normal map is unplugged. If an artist's own Normal Map / Bump node is
+        left with a live input but no output, it goes back into the BSDF's Normal (that
+        is where wire_strokes found it); otherwise the mesh's own normals show."""
+    if mat is None:
+        return grey
+    if not mat.use_nodes or not (_stroke_nodes(mat.node_tree, "_stroke_indirection")
+                                 or _stroke_nodes(mat.node_tree, "_stroke_normal")):
+        return mat
+    c = mat.copy()
+    nt = c.node_tree
+    for n in _stroke_nodes(nt, "_stroke_indirection"):
+        for link in list(n.outputs["Color"].links):
+            to, to_node = link.to_socket, link.to_node
+            nt.links.remove(link)
+            if not (to_node.bl_idname == "ShaderNodeTexImage" and to.identifier == "Vector"):
+                try:
+                    to.default_value = (0.5,) * len(to.default_value)
+                except (AttributeError, TypeError):
+                    try:
+                        to.default_value = 0.5
+                    except (AttributeError, TypeError):
+                        pass
+    for n in _stroke_nodes(nt, "_stroke_normal"):
+        for link in list(n.outputs["Color"].links):
+            nm = link.to_node
+            nt.links.remove(link)
+            # an object-space Normal Map with nothing plugged in outputs a fixed normal,
+            # which would be wrong everywhere: take it out of the shader entirely
+            if nm.bl_idname == "ShaderNodeNormalMap":
+                for out in list(nm.outputs["Normal"].links):
+                    nt.links.remove(out)
+    bsdf = next((n for n in nt.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled"), None)
+    if bsdf is not None and not bsdf.inputs["Normal"].links:
+        for n in nt.nodes:
+            live = any(i.links for i in n.inputs)
+            if n.bl_idname in ("ShaderNodeNormalMap", "ShaderNodeBump") and live \
+                    and not n.outputs["Normal"].links:
+                nt.links.new(n.outputs["Normal"], bsdf.inputs["Normal"])
+                break
+    return c
+
+
 def plain_textured(albedo_img):
     """The model as it would look WITHOUT AutoStroke: its albedo on its own UVs."""
     mat = bpy.data.materials.new("showcase_plain_%s" % albedo_img.name)
@@ -146,13 +203,14 @@ def painterly_colour(src_mat, nrm_img, ind_img, albedo_img):
 # Camera
 # ---------------------------------------------------------------------------
 
-def camera_for(obj, base, view=None, spin=False):
+def camera_for(obj, base, view=None, spin=False, pivot=None):
     """A copy of `base` looking along base's own direction, or from `view` =
     (dx, dy, dz[, roll_deg]) towards the object, framed tightly on the object's vertices as
     projected onto the image plane (5% margin), for the scene's current resolution.
 
     With `spin`, the framing holds for the object turned to ANY angle about the world Z
-    axis through its origin -- what a turntable needs, so nothing leaves frame mid-turn."""
+    axis through `pivot` (default: its origin) -- what a turntable needs, so nothing
+    leaves frame mid-turn."""
     cam = base.copy()
     cam.data = base.data.copy()
     bpy.context.scene.collection.objects.link(cam)
@@ -171,7 +229,7 @@ def camera_for(obj, base, view=None, spin=False):
     # vertices in the camera's frame (camera looks down -Z); the camera sits at (cx, cy, d)
     inv, mw = rot.inverted(), obj.matrix_world
     if spin:
-        cx, cy, d = _spin_fit(obj, inv, tx, ty)
+        cx, cy, d = _spin_fit(obj, inv, tx, ty, pivot)
     else:
         world = [mw @ v.co for v in obj.data.vertices]
         pts = [inv @ p for p in world]
@@ -182,22 +240,27 @@ def camera_for(obj, base, view=None, spin=False):
     return cam
 
 
-def _spin_fit(obj, inv, tx, ty):
-    """camera_for's fit over every turn of 10 deg about world Z through the object's
-    origin -- in numpy, since that is 36 copies of every vertex."""
+def _spin_fit(obj, inv, tx, ty, pivot=None):
+    """camera_for's fit over every turn of 10 deg about world Z through `pivot` (default
+    the object's origin) -- in numpy, since that is 36 copies of every vertex."""
     import numpy as np
     n = len(obj.data.vertices)
     co = np.empty(n * 3, np.float64)
     obj.data.vertices.foreach_get("co", co)
     mw = np.array(obj.matrix_world)
-    world = co.reshape(-1, 3) @ mw[:3, :3].T + mw[:3, 3]
-    o = mw[:3, 3]
-    a = np.radians(np.arange(0, 360, 10))[:, None]
-    x, y = world[:, 0] - o[0], world[:, 1] - o[1]
-    turned = np.stack([o[0] + np.cos(a) * x - np.sin(a) * y,
-                       o[1] + np.sin(a) * x + np.cos(a) * y,
-                       np.broadcast_to(world[:, 2], (len(a), n))], -1).reshape(-1, 3)
-    pts = turned @ np.array(inv.to_matrix()).T
+    # Blender's numpy 1.26 on Apple's Accelerate raises spurious divide/overflow flags
+    # from matmul even when every result is finite; hush them rather than alarm the user.
+    with np.errstate(all="ignore"):
+        world = co.reshape(-1, 3) @ mw[:3, :3].T + mw[:3, 3]
+        o = np.array(pivot, np.float64) if pivot is not None else mw[:3, 3]
+        a = np.radians(np.arange(0, 360, 10))[:, None]
+        x, y = world[:, 0] - o[0], world[:, 1] - o[1]
+        turned = np.stack([o[0] + np.cos(a) * x - np.sin(a) * y,
+                           o[1] + np.sin(a) * x + np.cos(a) * y,
+                           np.broadcast_to(world[:, 2], (len(a), n))], -1).reshape(-1, 3)
+        pts = turned @ np.array(inv.to_matrix()).T
+    if not np.isfinite(pts).all():
+        raise ValueError("%s: non-finite vertex positions, can't frame it" % obj.name)
     cx = (pts[:, 0].max() + pts[:, 0].min()) / 2.0
     cy = (pts[:, 1].max() + pts[:, 1].min()) / 2.0
     d = float((np.maximum(np.abs(pts[:, 0] - cx) / tx,
@@ -334,20 +397,61 @@ def studio(resolution, view=(-0.7, -1.0, -0.2)):
     return base
 
 
-def turntable(obj, frames):
-    """One linear, seamlessly looping 360 deg turn of the OBJECT about world Z (lights and
-    camera stay put, so strokes catch the light as the surface turns). Frame frames+1
-    would equal frame 1, so the rendered range 1..frames loops without a doubled frame."""
+def bbox_center(obj):
+    """World-space centre of an object's bounding box."""
+    corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    return sum(corners, Vector()) / 8.0
+
+
+def turntable_pivot(obj, frames):
+    """Turn an object that is already placed and rotated in a scene about world Z through
+    its bounding-box centre, without touching its own transform: it is parented (keeping
+    its world matrix) to a new empty at that centre, and the EMPTY turns 360 deg over
+    `frames`, linear, looping. Returns the pivot location."""
     sc = bpy.context.scene
     sc.frame_start, sc.frame_end = 1, frames
     sc.render.fps = 30
-    obj.rotation_mode = 'XYZ'
-    obj.animation_data_clear()
-    obj.rotation_euler = (0.0, 0.0, 0.0)
-    obj.keyframe_insert("rotation_euler", index=2, frame=1)
-    obj.rotation_euler = (0.0, 0.0, 2.0 * math.pi)
-    obj.keyframe_insert("rotation_euler", index=2, frame=frames + 1)
-    _linear_everywhere(obj)
+    c = bbox_center(obj)
+    pivot = bpy.data.objects.new("showcase_pivot_%s" % obj.name, None)
+    sc.collection.objects.link(pivot)
+    pivot.location = c
+    bpy.context.view_layer.update()
+    mw = obj.matrix_world.copy()
+    obj.parent = pivot
+    obj.matrix_parent_inverse = pivot.matrix_world.inverted()
+    obj.matrix_world = mw
+    pivot.rotation_mode = 'XYZ'
+    pivot.keyframe_insert("rotation_euler", index=2, frame=1)
+    pivot.rotation_euler = (0.0, 0.0, 2.0 * math.pi)
+    pivot.keyframe_insert("rotation_euler", index=2, frame=frames + 1)
+    _linear_everywhere(pivot)
+    sc.frame_set(1)
+    return c
+
+
+def relink_missing(search_dirs):
+    """Point image datablocks whose file is missing at a same-named file found under any of
+    `search_dirs` (in memory only). Returns [(image name, new path)] and the still-missing
+    list."""
+    found, missing = [], []
+    index = {}
+    for root in search_dirs:
+        for dirpath, _dirs, files in os.walk(os.path.expanduser(root)):
+            for f in files:
+                index.setdefault(f, os.path.join(dirpath, f))
+    for im in bpy.data.images:
+        if im.source != 'FILE' or im.packed_file:
+            continue
+        if os.path.exists(bpy.path.abspath(im.filepath)):
+            continue
+        hit = index.get(os.path.basename(bpy.path.abspath(im.filepath)))
+        if hit:
+            im.filepath = hit
+            im.reload()
+            found.append((im.name, hit))
+        else:
+            missing.append(im.name)
+    return found, missing
 
 
 def _linear_everywhere(obj):

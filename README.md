@@ -45,7 +45,7 @@ Blender 5.0+ · GPL-3.0-or-later
 
 ## Install
 
-1. Download [`autostroke-0.13.1.zip`](autostroke-0.13.1.zip).
+1. Download [`autostroke-0.13.2.zip`](autostroke-0.13.2.zip).
 2. In Blender 5.0 or later: **Edit → Preferences → Get Extensions**, then the **▾** menu
    at the top right → **Install from Disk…**, and pick the zip.
 

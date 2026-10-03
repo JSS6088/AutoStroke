@@ -238,6 +238,12 @@ def build(obj, force_rebuild=False):
             # another object's copy (this object was duplicated after a bake): trace it
             # back to the artist's material rather than copying a copy
             originals[i] = cur.get(SOURCE, cur.name) if cur is not None else ""
+        orig = bpy.data.materials.get(originals[i]) if originals[i] else None
+        if orig is not None:
+            # Once every slot shows the copy, the original has no users, and Blender drops
+            # zero-user data when the file is saved -- Remove Strokes would find nothing
+            # to put back after a reopen. A fake user keeps it; restore() clears it.
+            orig.use_fake_user = True
         src = bpy.data.materials.get(originals[i]) if originals[i] else None
         if src is None:
             slot.material = grey
@@ -265,6 +271,8 @@ def restore(obj):
     n = 0
     for slot, name in zip(obj.material_slots, originals):
         slot.material = bpy.data.materials.get(name) if name else None
+        if slot.material is not None:
+            slot.material.use_fake_user = False     # in use again; build() had set it
         n += 1
     if ORIGINALS in obj:
         del obj[ORIGINALS]

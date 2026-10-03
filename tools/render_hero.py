@@ -181,6 +181,9 @@ def model(e, report):
     base = lib.studio(ASPECTS[aspects[0]], e["view"])      # lights once per model
     cam = None
     grey = lib.grey_material()
+    # the turn is carried by an empty at the model's centre, so the model keeps whatever
+    # rotation it has; the camera is fitted around that same centre
+    pivot = lib.turntable_pivot(obj, FRAMES)
     rec = report.setdefault(name, {"bakes": []})
     for bi, brush in enumerate([e["brush"]] + list(e["brushes"])):
         set_look(e, brush)
@@ -203,11 +206,9 @@ def model(e, report):
             sc.render.resolution_x, sc.render.resolution_y = ASPECTS[asp]
             if cam is not None:
                 bpy.data.objects.remove(cam, do_unlink=True)
-            obj.animation_data_clear()
-            obj.rotation_euler = (0.0, 0.0, 0.0)          # frame the model at rest
-            cam = lib.camera_for(obj, base, e["view"], spin=True)
+            sc.frame_set(1)
+            cam = lib.camera_for(obj, base, e["view"], spin=True, pivot=pivot)
             sc.camera = cam
-            lib.turntable(obj, FRAMES)
             folder = os.path.join(OUT, name, asp)
             if bi == 0:
                 assign(obj, before)

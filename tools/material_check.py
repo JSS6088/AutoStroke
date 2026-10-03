@@ -100,6 +100,8 @@ def main():
     check("plain-colour material keeps its colour and roughness under the tone",
           tuple(round(v, 3) for v in mmul.inputs[6].default_value) == (0.2, 0.3, 0.4, 1.0)
           and abs(mbs.inputs["Roughness"].default_value - 0.25) < 1e-6)
+    check("originals are kept alive for Remove Strokes (fake user: a save would drop them)",
+          wood.use_fake_user and metal.use_fake_user and emit.use_fake_user)
     grey = bpy.data.materials.get("Crate_AutoStroke")
     check("Emission-only material falls back to the grey AutoStroke material",
           s[2] == grey and "Emit" in msg)
@@ -133,6 +135,20 @@ def main():
     check("every slot is back to what it held before", r == [wood, metal, emit, None],
           str([m.name if m else None for m in r]))
     check("the restore record is cleared", M.ORIGINALS not in obj)
+    check("restored materials drop the fake user again",
+          not metal.use_fake_user and not emit.use_fake_user)
+
+    print("\nSURVIVES SAVE AND REOPEN")
+    import tempfile
+    M.build(obj)
+    path = os.path.join(tempfile.mkdtemp(), "roundtrip.blend")
+    bpy.ops.wm.save_as_mainfile(filepath=path, copy=True)      # a copy: never this file
+    bpy.ops.wm.open_mainfile(filepath=path)
+    obj = bpy.data.objects["Crate"]
+    M.restore(obj)
+    check("Remove Strokes after a save + reopen still finds the originals",
+          [s.material.name if s.material else None for s in obj.material_slots]
+          == ["Wood", "Metal", "Emit", None])
 
     print("\nOLDER FILES (one grey AutoStroke material in slot 0, nothing recorded)")
     legacy = bpy.data.objects.new("Legacy", bpy.data.meshes.new("LegacyMesh"))
