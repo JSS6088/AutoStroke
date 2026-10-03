@@ -225,6 +225,15 @@ def main():
         os.rename(os.path.join(root, "standard"), os.path.join(root, "zzz"))
         check("without a standard set the order is just alphabetical",
               B.sets(root) == ["extra", "rough", "zzz"], str(B.sets(root)))
+        # ---- what actually ships ------------------------------------------
+        B.refresh()
+        shipped = B.default_root()
+        check("the add-on ships three sets, standard first",
+              B.sets(shipped) == ["standard", "rough", "thin"], str(B.sets(shipped)))
+        counts = {n: len([f for f in os.listdir(os.path.join(shipped, n))
+                          if f.lower().endswith(B.EXTS)]) for n in B.sets(shipped)}
+        check("each shipped set holds four brushes",
+              all(c == 4 for c in counts.values()), str(counts))
     finally:
         shutil.rmtree(root, ignore_errors=True)
         sys.modules.pop("bpy", None)

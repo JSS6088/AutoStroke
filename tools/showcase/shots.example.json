@@ -3,7 +3,7 @@
     "Copy this file to shots.json (git-ignored) and point each entry at a model file.",
     "file: .glb .gltf .fbx .obj or .blend; object: one object's name, or null for all of them (joined).",
     "strokes: Stroke Count. stroke_size: optional, else the scene default (4).",
-    "brush: a shipped set (standard, rough) or a folder of brush images. brushes: extra sets, rendered as brush_<set> shots.",
+    "brush: a shipped set (standard, rough, thin) or a folder of brush images. brushes: extra sets, rendered as brush_<set> shots.",
     "view: camera direction from the model's centre, e.g. [-0.7, -1, -0.2] = front, a little left and below.",
     "albedo: auto = the image feeding Principled Base Color; a path = that image; null = grey.",
     "hero: true renders a before->after wipe in encode_hero.sh."

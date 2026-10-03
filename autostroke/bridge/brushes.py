@@ -1,8 +1,8 @@
 """Brush sets: a folder of stroke images the baker draws from at random.
 
 A set is a subdirectory holding one or more images. The shipped root is assets/brushes/
-(`standard`, `rough`); pointing Brush Folder at another directory makes ITS subdirectories
-the sets instead, which is how an artist uses their own pack.
+(`standard`, `rough`, `thin`); pointing Brush Folder at another directory makes ITS
+subdirectories the sets instead, which is how an artist uses their own pack.
 
 Nothing here normalises the brushes against each other, and that is a decision rather than
 an omission: brush packs arrive normalised, and an artist who draws one mark longer than
@@ -24,9 +24,10 @@ being first in the list IS the default. Everything else stays alphabetical."""
 
 BRUSH_MAX_PX = 1024
 """Masks are decoded to float32, so the shipped 2048px brushes would be 16.8 MB each --
-134 MB for eight. Halving them costs at most 0.10 points of painted fraction and 0.2 deg
-of long axis (measured across both sets) and brings that to 34 MB. A stamp covers ~40
-texels on a 2K map, so 1024 is still ~25x more brush detail than any stroke can show."""
+67 MB for a set of four. Halving them costs at most 0.10 points of painted fraction and
+0.2 deg of long axis (measured across the standard and rough sets) and brings a set to
+17 MB. A stamp covers ~40 texels on a 2K map, so 1024 is still ~25x more brush detail
+than any stroke can show."""
 
 
 def default_root():

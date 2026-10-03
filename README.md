@@ -32,8 +32,8 @@ Blender 5.0+ · GPL-3.0-or-later
 
 - **Stroke Count**: ask for a total, and per-face density is solved to hit it. Min/Max
   strokes per face.
-- **Brush sets**: `standard` and `rough` built in, or point it at a folder of your own
-  brush PNGs.
+- **Brush sets**: `standard`, `rough` and `thin` built in, or point it at a folder of
+  your own brush PNGs.
 - **Look controls**: Stroke Size, Size Variation, Global Rotation, Rotation Jitter,
   Stroke Cutoff.
 - **Crease guard**: strokes don't reach around sharp folds.
@@ -45,7 +45,7 @@ Blender 5.0+ · GPL-3.0-or-later
 
 ## Install
 
-1. Download [`autostroke-0.13.2.zip`](autostroke-0.13.2.zip).
+1. Download [`autostroke-0.13.3.zip`](autostroke-0.13.3.zip).
 2. In Blender 5.0 or later: **Edit → Preferences → Get Extensions**, then the **▾** menu
    at the top right → **Install from Disk…**, and pick the zip.
 
