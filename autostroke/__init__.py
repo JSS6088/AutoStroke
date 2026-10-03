@@ -3,7 +3,7 @@
 bl_info = {
     "name": "AutoStroke",
     "author": "Jason",
-    "version": (0, 13, 3),
+    "version": (0, 13, 4),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > AutoStroke",
     "description": "Bake painterly flat-per-cell indirection maps from a mesh",

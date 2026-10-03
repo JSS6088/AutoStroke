@@ -23,10 +23,10 @@ cannot take a `default=` -- Blender only accepts one when `items` is a fixed lis
 being first in the list IS the default. Everything else stays alphabetical."""
 
 BRUSH_MAX_PX = 1024
-"""Masks are decoded to float32, so the shipped 2048px brushes would be 16.8 MB each --
-67 MB for a set of four. Halving them costs at most 0.10 points of painted fraction and
-0.2 deg of long axis (measured across the standard and rough sets) and brings a set to
-17 MB. A stamp covers ~40 texels on a 2K map, so 1024 is still ~25x more brush detail
+"""Masks are decoded to float32, so a 2048px brush would be 16.8 MB -- 67 MB for a set of
+four. Halving costs at most 0.10 points of painted fraction and 0.2 deg of long axis
+(measured on the standard and rough sets at 2048; they now ship at 1024) and brings a set
+to 17 MB. A stamp covers ~40 texels on a 2K map, so 1024 is still ~25x more brush detail
 than any stroke can show."""
 
 
