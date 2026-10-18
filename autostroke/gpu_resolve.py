@@ -75,6 +75,37 @@ def chunks(m, size=CHUNK):
     return [(a, min(a + size, m)) for a in range(0, m, size)]
 
 
+MAX_VISITS = 100_000_000
+"""Candidate strokes one dispatch may test, summed over its texels. Each texel loops over
+every stroke that can reach its triangle, and that list is uncapped: a large triangle
+beside dense geometry, or a big Stroke Size with Size Variation, gathers hundreds. A
+full 4M-texel chunk of those is billions of iterations in ONE command buffer -- long
+enough for the GPU watchdog to kill it, which Blender does not survive. The live preview
+only shades the pixels on screen, which is how a model could preview fine and still
+crash the bake. Splitting by work keeps every dispatch short; readback cost is
+unchanged, since it scales with texels, not dispatches."""
+
+MAX_LIST = 20_000
+"""A triangle reachable by more strokes than this sends the bake to the CPU: one GPU
+thread would loop that long by itself, and no chunking can split a single texel."""
+
+
+def work_chunks(weights, size=CHUNK, budget=MAX_VISITS):
+    """[(a, b), ...] covering range(len(weights)) in order: each at most `size` texels
+    and, unless one texel alone exceeds it, at most `budget` summed weight."""
+    m = len(weights)
+    if m == 0:
+        return []
+    cum = np.concatenate([[0], np.cumsum(np.asarray(weights, np.int64))])
+    out, a = [], 0
+    while a < m:
+        b = int(np.searchsorted(cum, cum[a] + budget, side='right')) - 1
+        b = min(max(b, a + 1), a + size, m)
+        out.append((a, b))
+        a = b
+    return out
+
+
 def pack_chunk(xyz, w=None, width=CHUNK_W):
     """(m, 3) floats -> (h, width, 4) float32, element i at row i // width, col i % width.
     The fourth channel carries `w` when given (the texel's triangle id -- exact as a float
@@ -158,6 +189,8 @@ def make_compute_shader():
 def _texture(arr, fmt, channels):
     import gpu
     h, w = arr.shape[:2]
+    from .livepreview import check_texture
+    check_texture(w, h, "bake chunk")
     return gpu.types.GPUTexture(
         (w, h), format=fmt,
         data=gpu.types.Buffer('FLOAT', w * h * channels, np.ascontiguousarray(arr).ravel()))
@@ -192,8 +225,17 @@ def resolve(points, uv_self, pt_nrm, seeds, seed_tan, masks, cfg, pt_tri, rs):
                                     atlas_tile=BRUSH_MAX_PX)
     shader = make_compute_shader()
 
+    counts = np.asarray(rs["tri_count"], np.int64)
+    if counts.size and int(counts.max()) > MAX_LIST:
+        raise GPUResolveError(
+            "a triangle is reachable by %d strokes (GPU limit %d)"
+            % (int(counts.max()), MAX_LIST))
+    tri = np.asarray(pt_tri, np.int64)
+    ok = (tri >= 0) & (tri < counts.size)
+    work = np.where(ok, counts[np.clip(tri, 0, max(counts.size - 1, 0))], 0) + 1
+
     idx = np.empty(M, np.int64)
-    for a, b in chunks(M):
+    for a, b in work_chunks(work):
         m = b - a
         pts = pack_chunk(points[a:b], pt_tri[a:b])
         h = pts.shape[0]

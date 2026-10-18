@@ -114,7 +114,7 @@ class FakeWM:
             self.timers.remove(t)
 
     def modal_handler_add(self, op):
-        pass
+        self.modal_handlers = getattr(self, "modal_handlers", 0) + 1
 
     def progress_begin(self, a, b):
         pass
@@ -144,7 +144,8 @@ class FakeContext:
         self.scene = types.SimpleNamespace(
             autostroke=types.SimpleNamespace(est_scale=1.0, last_report="", resolution='1024',
                                              stroke_size=4.0),
-            render=None)
+            render=None, cycles=types.SimpleNamespace())
+        self.mode = 'OBJECT'
         self.view_layer = types.SimpleNamespace(update=lambda: None)
 
 
@@ -163,6 +164,8 @@ def main():
     sequencing_test_can_fail(bake_mod)
     partial_failure_tests(bake_mod)
     per_job_timing(bake_mod)
+    invoke_tests(bake_mod)
+    robustness_tests(bake_mod)
     report_batch_tests(bake_mod)
     device_tests(bake_mod)
 
@@ -208,8 +211,8 @@ def _wire_stub_job_methods(op, order, fail_on=None):
     intervening write), not _start_job's real per-object body, which needs real Cycles
     and mesh data that has no place in this pure-Python suite."""
     def start(context, job):
-        order.append("start(%s)" % job.obj.name)
-        if fail_on and job.obj.name == fail_on:
+        order.append("start(%s)" % job.name)
+        if fail_on and job.name == fail_on:
             job.error = "stub failure"
             return False
         job.gen = one_shot_gen(1.0, ("uv", "dbg", "covered", "lum"))
@@ -217,7 +220,7 @@ def _wire_stub_job_methods(op, order, fail_on=None):
         return True
 
     def write(context, job):
-        order.append("write(%s)" % job.obj.name)
+        order.append("write(%s)" % job.name)
         job.result = ("uv", "dbg", "covered", "lum")
         job.secs = time.time() - job.t0
         job.coverage = 100.0
@@ -342,8 +345,8 @@ def partial_failure_tests(bake_mod):
 
     check("batch still finishes ({'FINISHED'}) with a partial failure",
           result == {'FINISHED'}, result)
-    check("A and C completed", {j.obj.name for j in op.done} == {"A", "C"},
-          [j.obj.name for j in op.done])
+    check("A and C completed", {j.name for j in op.done} == {"A", "C"},
+          [j.name for j in op.done])
     check("B is recorded as failed, with a reason",
           op.failed == [("B", "stub failure")], op.failed)
     check("B's start attempt is in the order, its write is not",
@@ -369,10 +372,171 @@ def partial_failure_tests(bake_mod):
     result2 = op2._advance(op2.jobs and FakeContext()) if not started else None
     if started is False:
         # invoke()'s own recovery path: first job failed immediately
-        op2.failed.append((op2.jobs[0].obj.name, op2.jobs[0].error))
+        op2.failed.append((op2.jobs[0].name, op2.jobs[0].error))
         result2 = op2._advance(FakeContext())
     check("all-failed batch returns {'CANCELLED'}", result2 == {'CANCELLED'}, result2)
     check("nothing recorded as done", op2.done == [])
+
+
+def invoke_tests(bake_mod):
+    print("\nINVOKE(): NEVER RETURNS CANCELLED WITH A MODAL HANDLER REGISTERED")
+    # Returning CANCELLED from invoke() after modal_handler_add() frees the operator
+    # while its handler stays registered, and Blender's status bar then crashes reading
+    # it on the next redraw. Exercise the REAL invoke(), everything around it stubbed.
+    saved = {n: getattr(bake_mod, n) for n in
+             ("targets", "resolve_working_dir", "load_brush", "config_from_settings",
+              "pick_device")}
+    objs = [FakeObj("A"), FakeObj("B")]
+    bake_mod.targets = lambda context: objs
+    bake_mod.resolve_working_dir = lambda st: "/tmp"
+    bake_mod.load_brush = lambda st, cfg: ([None], "standard")
+    bake_mod.config_from_settings = lambda st, mask: None
+    bake_mod.pick_device = lambda requested, background: ('CPU', "")
+    had_app = hasattr(bake_mod.bpy, "app")
+    if not had_app:
+        bake_mod.bpy.app = types.SimpleNamespace(background=True)
+    try:
+        def run(start):
+            op = bake_mod.AUTOSTROKE_OT_bake()
+            msgs = []
+            op.report = lambda level, msg: msgs.append(msg)
+            op._start_job = start
+            ctx = FakeContext()
+            return op.invoke(ctx, None), ctx, msgs
+
+        def fail(context, job):
+            job.error = "no UV map"
+            return False
+        result, ctx, msgs = run(fail)
+        check("every object fails to start: invoke() returns CANCELLED", result == {'CANCELLED'},
+              result)
+        check("...without ever registering a modal handler or a timer",
+              getattr(ctx.window_manager, "modal_handlers", 0) == 0
+              and not ctx.window_manager.timers)
+        check("...and the report says why, per object",
+              "failed: A — no UV map" in ctx.scene.autostroke.last_report
+              and "failed: B — no UV map" in ctx.scene.autostroke.last_report,
+              ctx.scene.autostroke.last_report)
+
+        def second_starts(context, job):
+            if job.name == "A":
+                job.error = "no UV map"
+                return False
+            return True
+        op_result, ctx, msgs = run(second_starts)
+        check("the first fails, the second starts: RUNNING_MODAL with one handler",
+              op_result == {'RUNNING_MODAL'}
+              and getattr(ctx.window_manager, "modal_handlers", 0) == 1, op_result)
+    finally:
+        for n, f in saved.items():
+            setattr(bake_mod, n, f)
+        if not had_app:
+            del bake_mod.bpy.app
+
+
+def robustness_tests(bake_mod):
+    print("\nA BAKE SURVIVES THE USER CHANGING THINGS UNDER IT")
+    data = bake_mod.bpy.data
+
+    # -- the object is looked up again, never trusted --------------------------------
+    cube = FakeObj("Cube")
+    cube.session_uid = 7
+    data.objects["Cube"] = cube
+    job = bake_mod.Job(cube)
+    check("a Job keeps the name and uid, not the Object",
+          not hasattr(job, "obj") and job.name == "Cube" and job.uid == 7)
+    check("resolve() finds it while it is there", job.resolve() is cube)
+
+    def raises(fn):
+        try:
+            fn()
+        except RuntimeError as e:
+            return str(e)
+        return None
+    del data.objects["Cube"]
+    check("deleted mid-bake: resolve() raises a readable RuntimeError",
+          raises(job.resolve) and "Cube" in raises(job.resolve), raises(job.resolve))
+    other = FakeObj("Cube")
+    other.session_uid = 8                 # same name, different object (undo, new file)
+    data.objects["Cube"] = other
+    check("same name but another object: resolve() refuses it", raises(job.resolve))
+    del data.objects["Cube"]
+
+    # -- one operator, wired up the way invoke() leaves it --------------------------
+    def running_op(names, gens):
+        op = bake_mod.AUTOSTROKE_OT_bake()
+        objs = [FakeObj(n) for n in names]
+        for o in objs:
+            data.objects[o.name] = o
+        op.jobs = [bake_mod.Job(o) for o in objs]
+        for j, g in zip(op.jobs, gens):
+            j.gen = g
+        op.i = 0
+        op.stages = bake_mod.Stages()
+        op.done, op.failed = [], []
+        op._batch_t0 = time.time()
+        op.workdir, op.mask, op.brush_set, op.cfg = "/tmp", [None], "standard", None
+        ctx = FakeContext()
+        op._timer = ctx.window_manager.event_timer_add(0.05)
+        op._progress = 0.0
+        op.report = lambda level, msg: None
+        bake_mod.AUTOSTROKE_OT_bake._running = True
+        return op, ctx
+
+    timer_ev = types.SimpleNamespace(type='TIMER')
+
+    def boom():
+        yield 0.1
+        raise ValueError("resolver bug")
+
+    op, ctx = running_op(["A"], [boom()])
+    op.modal(ctx, timer_ev)                         # yields 0.1, then raises
+    result = op.modal(ctx, timer_ev)
+    check("an unexpected exception mid-bake becomes this object's failure",
+          op.failed and op.failed[0][0] == "A" and "ValueError" in op.failed[0][1],
+          op.failed)
+    check("...and the bake ends cleanly: timer gone, poll open again",
+          result == {'CANCELLED'} and not ctx.window_manager.timers
+          and not bake_mod.AUTOSTROKE_OT_bake._running, result)
+
+    def forever():
+        while True:
+            yield 0.5
+    op, ctx = running_op(["B"], [forever()])
+    ctx.area = None                                  # area closed / maximised mid-bake
+    try:
+        r = op.modal(ctx, timer_ev)
+        ok = r == {'RUNNING_MODAL'}
+    except Exception as e:
+        ok, r = False, e
+    check("a closed area mid-bake is not an error", ok, r)
+
+    op, ctx = running_op(["C"], [one_shot_gen(0.5, None)])
+    op.cancel(ctx)
+    check("cancel() (File > Open, window closed) removes the timer and frees poll",
+          not ctx.window_manager.timers and not bake_mod.AUTOSTROKE_OT_bake._running)
+
+    bake_mod.AUTOSTROKE_OT_bake._running = True
+    sel = FakeObj("Sel")
+    check("a second Bake is refused while one runs",
+          not bake_mod.AUTOSTROKE_OT_bake.poll(FakeContext([sel], sel)))
+    bake_mod.AUTOSTROKE_OT_bake._running = False
+    check("...and allowed again once it ends",
+          bake_mod.AUTOSTROKE_OT_bake.poll(FakeContext([sel], sel)))
+
+    op, ctx = running_op(["D", "E"], [one_shot_gen(0.5, None), one_shot_gen(0.5, None)])
+    op.done.append(op.jobs[0])
+    r = op.modal(ctx, types.SimpleNamespace(type='ESC'))
+    check("Esc after an object finished: FINISHED, so its maps get an undo step",
+          r == {'FINISHED'}, r)
+
+    j = bake_mod.Job(FakeObj("F"))
+    j.surf_nrm = j.uv_self = j.valid = j.result = np.zeros(10)
+    j.coverage, j.secs, j.sstats = 90.0, 1.0, {"strokes": 5}
+    j.release()
+    check("release() drops the per-texel arrays but keeps what the report needs",
+          j.surf_nrm is None and j.uv_self is None and j.result is None
+          and j.coverage == 90.0 and j.sstats == {"strokes": 5})
 
 
 def per_job_timing(bake_mod):
@@ -400,7 +564,10 @@ def per_job_timing(bake_mod):
     try:
         H = W = 4
         valid = np.ones(H * W, bool)
-        job1 = bake_mod.Job(FakeObj("Slow"))
+        slow, fast = FakeObj("Slow"), FakeObj("Fast")
+        # _write() looks its object up by name, as it does in Blender
+        bake_mod.bpy.data.objects.update({"Slow": slow, "Fast": fast})
+        job1 = bake_mod.Job(slow)
         job1.t0 = time.time() - 5.0          # this job "took" 5s
         job1.H, job1.W, job1.valid = H, W, valid
         job1.uv_self = np.zeros((H * W, 2), np.float32)
@@ -419,7 +586,7 @@ def per_job_timing(bake_mod):
         # that has already been "running" far longer than either job individually --
         # if secs were computed from a shared/batch clock this would read as ~8s+, not ~1s
         op._batch_t0 = time.time() - 20.0
-        job2 = bake_mod.Job(FakeObj("Fast"))
+        job2 = bake_mod.Job(fast)
         job2.t0 = time.time() - 1.0
         job2.H, job2.W, job2.valid = H, W, valid
         job2.uv_self = np.zeros((H * W, 2), np.float32)
@@ -586,11 +753,11 @@ def device_tests(bake_mod):
     order, used = [], []
 
     def start(context, j):
-        order.append("start(%s)" % j.obj.name)
+        order.append("start(%s)" % j.name)
         j.t0 = time.time()
         j.pos_note = "position: baked"
         if op2.device == 'GPU':
-            gpu = gpu_bad if j.obj.name == "B" else gpu_ok
+            gpu = gpu_bad if j.name == "B" else gpu_ok
             j.device = 'GPU'
             j.pos_note += " · GPU"
             j.gen = op2._gpu_or_cpu(j, gpu, cpu_ok)
@@ -600,8 +767,8 @@ def device_tests(bake_mod):
         return True
 
     def write(context, j):
-        order.append("write(%s)" % j.obj.name)
-        used.append((j.obj.name, j.device))
+        order.append("write(%s)" % j.name)
+        used.append((j.name, j.device))
         j.secs, j.coverage = 0.0, 100.0
         j.sstats = {"strokes": 1, "radius_med": 0.1, "at_min": 0.0, "at_max": 0.0}
 

@@ -62,7 +62,8 @@ def stub_bpy():
     bpy.app = types.SimpleNamespace(
         timers=types.SimpleNamespace(register=lambda *a, **k: None,
                                      unregister=lambda *a, **k: None,
-                                     is_registered=lambda *a, **k: False))
+                                     is_registered=lambda *a, **k: False),
+        handlers=types.SimpleNamespace(load_pre=[]))
     bpy.context = None
     bpy.data = types.SimpleNamespace(objects={}, images={}, materials={})
     bpy.path = types.SimpleNamespace(abspath=lambda p: p)
@@ -107,6 +108,9 @@ def main():
     check("the settings group registered",
           any(c.__name__ == "AutoStrokeSettings" for c in registered))
     check("the scene got its pointer", hasattr(bpy.types.Scene, "autostroke"))
+    check("a persistent load_pre handler turns the preview off before a file load",
+          len(bpy.app.handlers.load_pre) == 1
+          and getattr(bpy.app.handlers.load_pre[0], "_bpy_persistent", False))
 
     try:
         autostroke.unregister()
@@ -114,7 +118,8 @@ def main():
         check("unregister()", False, "%s: %s" % (type(e).__name__, e))
     else:
         check("unregister()", True, "%d classes left" % len(registered))
-        check("and it unwinds completely", not registered, "%d left" % len(registered))
+        check("and it unwinds completely", not registered and not bpy.app.handlers.load_pre,
+              "%d classes, %d handlers left" % (len(registered), len(bpy.app.handlers.load_pre)))
 
     print("\n%s\n" % ("ALL PASS" if not FAILED else "FAILED: " + ", ".join(FAILED)))
     return 1 if FAILED else 0

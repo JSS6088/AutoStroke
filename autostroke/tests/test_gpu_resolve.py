@@ -167,6 +167,39 @@ def layout(gpu_resolve):
     check("a chunk's texture is never wider than 4096 (Metal caps at 16384)",
           gpu_resolve.pack_chunk(np.zeros((gpu_resolve.CHUNK, 3), np.float32)).shape[1] <= 4096)
 
+    # Work-bounded chunks: one dispatch must never carry unbounded loop iterations.
+    rng = np.random.default_rng(3)
+    for m, budget in ((0, 100), (1, 100), (5000, 1000), (200_000, 250_000), (50_000, 3)):
+        w = rng.integers(1, 400, m)
+        ch = gpu_resolve.work_chunks(w, size=60_000, budget=budget)
+        covered = sum(b - a for a, b in ch)
+        contiguous = all(ch[k][1] == ch[k + 1][0] for k in range(len(ch) - 1))
+        within = all(b - a == 1 or int(w[a:b].sum()) <= budget for a, b in ch)
+        ok = (covered == m and contiguous and within
+              and all(0 < b - a <= 60_000 for a, b in ch)
+              and (not ch or (ch[0][0] == 0 and ch[-1][1] == m)))
+        check("work_chunks(%d, budget %d): every texel once, each under budget" % (m, budget),
+              ok, "%d chunk(s)" % len(ch))
+    heavy = np.full(4_000_000, 600, np.int64)          # a big triangle, Stroke Size 10
+    ch = gpu_resolve.work_chunks(heavy)
+    check("a heavy model is split into dispatches of at most MAX_VISITS",
+          len(ch) > 1 and max(int(heavy[a:b].sum()) for a, b in ch) <= gpu_resolve.MAX_VISITS,
+          "%d dispatches" % len(ch))
+    light = np.full(gpu_resolve.CHUNK, 20, np.int64)
+    check("a light model keeps full-size chunks (no slowdown)",
+          len(gpu_resolve.work_chunks(light)) == 1)
+
+    # The brush atlas can never outgrow the GPU's texture limit.
+    from autostroke import livepreview
+    masks = [np.ones((1024, 1024), np.float32)] * 300
+    atlas, cols = livepreview.pack_brush_atlas(masks, max_tile=1024, max_side=16384)
+    check("300 brushes at 1024 px: the atlas shrinks its tiles to fit 16384",
+          max(atlas.shape) <= 16384 and cols == 18, "%s, %d cols" % (atlas.shape, cols))
+    atlas, cols = livepreview.pack_brush_atlas(
+        [np.ones((1024, 700), np.float32), np.ones((500, 500), np.float32)], max_tile=1024)
+    check("non-square and smaller brushes are resampled into their tiles",
+          atlas.shape == (2048, 2048) and atlas[:1024, :1024].all())
+
 
 def readback(gpu_resolve):
     print("\nREADBACK: A GPU THAT IS SILENTLY WRONG IS REFUSED, NOT SHIPPED")

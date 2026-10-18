@@ -191,18 +191,22 @@ def pack_strokes(seeds, tan, masks, cfg):
     return out, pos, r, T, nrm
 
 
-def pack_brush_atlas(masks, max_tile=512):
+def pack_brush_atlas(masks, max_tile=512, max_side=16384):
     """The brush set as one square atlas, cols x cols tiles. One texture, one sampler.
 
     `max_tile` caps each brush's tile: 512 is plenty for the preview's silhouette, while
     the GPU bake passes the full brush resolution so its mask test samples the same
-    pixels the CPU bake does."""
+    pixels the CPU bake does. `max_side` is the GPU's texture limit: a set big enough to
+    push cols * tile past it (257 brushes at the bake's 1024) would otherwise abort the
+    whole process with a native Metal assertion, so the tiles shrink to fit instead."""
+    if not masks:
+        raise mesh_bridge.MeshError("The brush set has no usable images")
     cols = int(np.ceil(np.sqrt(len(masks))))
-    tile = max(m.shape[0] for m in masks)
-    tile = min(tile, max_tile)
+    tile = max(max(m.shape) for m in masks)
+    tile = max(1, min(tile, max_tile, max_side // cols))
     atlas = np.zeros((cols * tile, cols * tile), np.float32)
     for i, m in enumerate(masks):
-        if m.shape[0] != tile:
+        if m.shape != (tile, tile):     # non-square brushes too, not just other sizes
             yi = (np.arange(tile) * (m.shape[0] / tile)).astype(np.int64)
             xi = (np.arange(tile) * (m.shape[1] / tile)).astype(np.int64)
             m = m[np.clip(yi, 0, m.shape[0] - 1)][:, np.clip(xi, 0, m.shape[1] - 1)]
@@ -220,11 +224,38 @@ def pack_brush_atlas(masks, max_tile=512):
 # inside a draw callback, where an exception can spam the console every redraw.
 # ---------------------------------------------------------------------------
 
+FLOAT_EXACT = 1 << 24
+"""Indices travel through float textures (triangle ids, candidate-list offsets) and are
+exact only below 2**24; past it neighbouring indices collapse and the search reads the
+wrong strokes."""
+
+
+def texture_limit():
+    """The largest texture side this GPU accepts, never above Metal's 16384."""
+    import gpu
+    try:
+        return min(16384, int(gpu.capabilities.max_texture_size_get()))
+    except Exception:
+        return 16384
+
+
+def check_texture(w, h, what):
+    """Refuse a texture the GPU cannot hold BEFORE asking for it: past the limit Metal
+    aborts the process instead of raising. A MeshError here leaves the preview showing
+    the reason, and sends the GPU bake to the CPU."""
+    lim = texture_limit()
+    if w < 1 or h < 1 or w > lim or h > lim:
+        raise mesh_bridge.MeshError(
+            "The %s would be %d x %d, past this GPU's %d texture limit -- lower Stroke "
+            "Count or Stroke Size" % (what, w, h, lim))
+
+
 def _flat_texture(values, width=4096):
     """A 1-D float array as an R32F 2-D texture, since 1-D textures are not portable."""
     import gpu
     n = max(len(values), 1)
     h = int(np.ceil(n / float(width)))
+    check_texture(width, h, "stroke list")
     buf = np.zeros(width * h, np.float32)
     buf[:len(values)] = values
     tex = gpu.types.GPUTexture((width, h), format='R32F',
@@ -263,6 +294,7 @@ def _pack_stroke_texture(packed, width=STROKE_TILE_W):
     import gpu
     out = stroke_tile_buffer(packed, width)
     h = out.shape[0]
+    check_texture(width, h, "stroke table")
     tex = gpu.types.GPUTexture(
         (width, h), format='RGBA32F',
         data=gpu.types.Buffer('FLOAT', width * h * 4, out.ravel()))
@@ -283,12 +315,18 @@ def upload_strokes(masks, cfg, seeds, tan, rs, atlas_tile=512):
     every slider tick); the bake passes full-resolution brushes.
     """
     import gpu
+    n_tris = int(rs["n_tris"])
+    if n_tris >= FLOAT_EXACT or len(rs["tri_strokes"]) >= FLOAT_EXACT:
+        raise mesh_bridge.MeshError(
+            "Too many triangles or stroke/triangle pairs for the GPU path (%d / %d, limit "
+            "%d) -- lower Stroke Size or Stroke Count"
+            % (n_tris, len(rs["tri_strokes"]), FLOAT_EXACT))
     packed, pos, r, T, nrm = pack_strokes(seeds, tan, masks, cfg)
 
     stroke_tex = _pack_stroke_texture(packed)
-    n_tris = int(rs["n_tris"])
     cell_w = 4096
     cell_h = int(np.ceil(max(n_tris, 1) / float(cell_w)))
+    check_texture(cell_w, cell_h, "triangle table")
     cbuf = np.zeros((cell_w * cell_h, 2), np.float32)
     cbuf[:n_tris, 0] = rs["tri_start"]
     cbuf[:n_tris, 1] = rs["tri_count"]
@@ -297,7 +335,8 @@ def upload_strokes(masks, cfg, seeds, tan, rs, atlas_tile=512):
         data=gpu.types.Buffer('FLOAT', cell_w * cell_h * 2, cbuf.ravel()))
     list_tex, list_w = _flat_texture(rs["tri_strokes"].astype(np.float32))
 
-    atlas, cols = pack_brush_atlas(masks, max_tile=atlas_tile)
+    atlas, cols = pack_brush_atlas(masks, max_tile=atlas_tile, max_side=texture_limit())
+    check_texture(atlas.shape[1], atlas.shape[0], "brush atlas")
     brush_tex = gpu.types.GPUTexture(
         atlas.shape, format='R32F',
         data=gpu.types.Buffer('FLOAT', atlas.size, np.ascontiguousarray(atlas).ravel()))
@@ -348,7 +387,8 @@ def _build(context, obj):
     # The mesh as the bake sees it (render settings), the same one the seeds and the reach
     # tables were built from -- see mesh_bridge.render_state.
     with mesh_bridge.render_state(obj):
-        me = obj.evaluated_get(context.evaluated_depsgraph_get()).to_mesh()
+        ev = obj.evaluated_get(context.evaluated_depsgraph_get())
+        me = ev.to_mesh()
         try:
             me.calc_loop_triangles()
             nv, nt = len(me.vertices), len(me.loop_triangles)
@@ -384,7 +424,7 @@ def _build(context, obj):
             # triangles (bridge/mesh.read_triangles), so the index means the same thing.
             vtri = np.repeat(np.arange(nt, dtype=np.float32), 3)
         finally:
-            obj.evaluated_get(context.evaluated_depsgraph_get()).to_mesh_clear()
+            ev.to_mesh_clear()          # the same evaluated object that made the mesh
 
     from gpu_extras.batch import batch_for_shader
     shader = make_shader()
@@ -397,22 +437,29 @@ def _build(context, obj):
     diag = float(np.linalg.norm(vpos.max(0) - vpos.min(0)))
     depth_offset = max(diag, 1e-6) * 0.001
 
-    return dict(up, shader=shader, batch=batch, obj=obj, depth_offset=depth_offset)
+    # The object by NAME and session uid, never the Object itself: the draw handler
+    # outlives undo, deletion and File > Open, and a release build does not invalidate a
+    # stored reference when its ID is freed -- the next redraw would read freed memory
+    # and take Blender down. Looked up again on every draw instead (_draw).
+    return dict(up, shader=shader, batch=batch, obj_name=obj.name,
+                obj_uid=obj.session_uid, depth_offset=depth_offset)
 
 
 def _draw():
     global _error
-    if _state is None:
+    s = _state
+    if s is None:
         return
+    import gpu
+    touched = False
     try:
-        import gpu
-        s = _state
-        obj = s["obj"]
-        if obj is None or obj.name not in bpy.data.objects:
-            return
+        obj = bpy.data.objects.get(s["obj_name"])
+        if obj is None or obj.session_uid != s["obj_uid"]:
+            return                  # deleted, undone away, renamed, or another file
         st = bpy.context.scene.autostroke
         mvp = bpy.context.region_data.perspective_matrix @ obj.matrix_world
         sh = s["shader"]
+        touched = True
         gpu.state.depth_test_set('LESS_EQUAL')
         gpu.state.depth_mask_set(True)
         gpu.state.face_culling_set('BACK')
@@ -430,11 +477,24 @@ def _draw():
                        (int(s["list_w"]), int(s["cell_w"]), int(s["cols"]),
                         int(st.live_mode)))
         s["batch"].draw(sh)
-        gpu.state.depth_mask_set(False)
-        gpu.state.face_culling_set('NONE')
     except Exception:                       # never raise inside a draw callback
         _error = traceback.format_exc().strip().splitlines()[-1]
-        disable()
+        _fail_soon()
+    finally:
+        if touched:                         # put back what this draw changed, always
+            gpu.state.depth_mask_set(False)
+            gpu.state.face_culling_set('NONE')
+
+
+def _fail_soon():
+    """Stop drawing NOW, and take the handler off once the draw has returned: removing a
+    draw handler from inside its own callback edits the list Blender is walking."""
+    global _state
+    _state = None
+    try:
+        bpy.app.timers.register(disable, first_interval=0.0)
+    except Exception:
+        pass
 
 
 def enabled():
@@ -581,12 +641,41 @@ class AUTOSTROKE_OT_live_refresh(bpy.types.Operator):
 classes = (AUTOSTROKE_OT_live, AUTOSTROKE_OT_live_refresh)
 
 
+def _on_load_pre(*_args):
+    """Before File > Open / New / Revert frees every datablock: switch the preview off and
+    drop what was derived from the old file. The draw handler belongs to the editor type,
+    not the file, so it would otherwise carry on into the new one."""
+    global _pending
+    disable()
+    _pending = False            # a debounce timer the load drops would never clear it
+    seed_cache.clear()
+    # Blender cancels a running bake on load (its cancel() clears this); belt and braces,
+    # so a bake that somehow ended without either can never lock the Bake button
+    from .ops import bake
+    bake.AUTOSTROKE_OT_bake._running = False
+    from .bridge import brushes
+    brushes.refresh()
+
+
+# What bpy.app.handlers.persistent does, without importing it at module load (the test
+# suite's bpy stub has no app.handlers): keep the handler registered across file loads.
+_on_load_pre._bpy_persistent = True
+
+
 def register():
     for c in classes:
         bpy.utils.register_class(c)
+    if _on_load_pre not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_on_load_pre)
 
 
 def unregister():
+    global _pending
+    if _on_load_pre in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.remove(_on_load_pre)
+    if bpy.app.timers.is_registered(_flush):
+        bpy.app.timers.unregister(_flush)
+    _pending = False
     disable()
     for c in reversed(classes):
         bpy.utils.unregister_class(c)

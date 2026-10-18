@@ -43,12 +43,18 @@ def preserved_bake_settings(scene):
         "use_selected_to_active": bk.use_selected_to_active,
         "normal_space": bk.normal_space,
         "normal_swizzle": (bk.normal_r, bk.normal_g, bk.normal_b),
+        "target": getattr(bk, "target", None),
     }
     has_cycles = hasattr(scene, "cycles")
     if has_cycles:
         saved["device"] = scene.cycles.device
         saved["samples"] = scene.cycles.samples
     scene.render.bake.use_selected_to_active = False
+    if saved["target"] is not None:
+        # Bake Target set to Color Attributes (a scene setting, easy to leave from other
+        # work) makes Cycles write vertex colours: the image stays empty and the bake
+        # reports 0% coverage with no error at all.
+        bk.target = 'IMAGE_TEXTURES'
     try:
         yield
     finally:
@@ -58,6 +64,8 @@ def preserved_bake_settings(scene):
         scene.render.bake.use_selected_to_active = saved["use_selected_to_active"]
         bk.normal_space = saved["normal_space"]
         bk.normal_r, bk.normal_g, bk.normal_b = saved["normal_swizzle"]
+        if saved["target"] is not None:
+            bk.target = saved["target"]
         if has_cycles:
             scene.cycles.device = saved["device"]
             scene.cycles.samples = saved["samples"]
@@ -129,15 +137,65 @@ def selectable(obj):
     """
     saved_select = obj.hide_select
     saved_hide = obj.hide_get()
-    obj.hide_select = False
-    if saved_hide:
-        obj.hide_set(False)
+    unlocked = unhidden = False
     try:
+        # each change is recorded as it is made, so a failure part-way still puts back
+        # exactly what was changed -- the pattern mesh.render_state uses
+        obj.hide_select = False
+        unlocked = True
+        if saved_hide:
+            obj.hide_set(False)
+            unhidden = True
         yield
     finally:
-        obj.hide_select = saved_select
-        if saved_hide:
+        if unlocked:
+            obj.hide_select = saved_select
+        if unhidden:
             obj.hide_set(True)
+
+
+@contextmanager
+def bakeable(obj):
+    """Let Cycles bake obj when its render or viewport state would otherwise refuse it.
+
+    These maps are a step of AutoStroke's own bake, not a render, but Cycles' bake
+    operator applies render rules to them:
+      - an object switched off for rendering, or held in a collection that is (a
+        showcase file keeps spare models in a render-disabled collection), fails with
+        "Object ... is not enabled for rendering";
+      - an object outside the 3D viewport's Local View fails with "No valid selected
+        objects", though it is selected.
+    Both are switched on for the bake and put back after, however it exits. Collections
+    are matched through all_objects, so one holding obj at any depth counts.
+    """
+    flipped = []
+    local = False
+    space = getattr(bpy.context, "space_data", None)
+    try:
+        # each change recorded as it is made, so a failure part-way restores exactly
+        # what was changed
+        if getattr(obj, "hide_render", False):
+            obj.hide_render = False
+            flipped.append(obj)
+        for coll in getattr(bpy.data, "collections", ()):
+            if coll.hide_render and coll.all_objects.get(obj.name) == obj:
+                coll.hide_render = False
+                flipped.append(coll)
+        if (getattr(space, "type", "") == 'VIEW_3D' and space.local_view is not None
+                and not obj.local_view_get(space)):
+            obj.local_view_set(space, True)
+            local = True
+            # local_view_set() only marks the change; until the view layer syncs, the
+            # next check -- this bake's selection, or the following bake's
+            # local_view_get() -- still sees the old membership
+            bpy.context.view_layer.update()
+        yield
+    finally:
+        for item in flipped:
+            item.hide_render = True
+        if local:
+            obj.local_view_set(space, False)
+            bpy.context.view_layer.update()
 
 
 @contextmanager
@@ -324,7 +382,8 @@ def _run(obj, mat, margin, channel, bake_type, normal_space=None):
     # preserved_selection is outermost so it restores LAST, after selectable() has put
     # the object's own hide/lock state back.
     with preserved_selection(bpy.context.view_layer), preserved_bake_settings(scene), \
-            disabled_geometry_nodes(obj), swapped_material(obj, mat), selectable(obj):
+            disabled_geometry_nodes(obj), swapped_material(obj, mat), selectable(obj), \
+            bakeable(obj):
         scene.render.engine = 'CYCLES'
         if hasattr(scene, "cycles"):
             scene.cycles.device = 'CPU'

@@ -225,6 +225,35 @@ def main():
         os.rename(os.path.join(root, "standard"), os.path.join(root, "zzz"))
         check("without a standard set the order is just alphabetical",
               B.sets(root) == ["extra", "rough", "zzz"], str(B.sets(root)))
+        # ---- what a Mac-zipped pack, or a re-asked dropdown, throws at it ---
+        B.refresh()
+        st.brush_dir = root
+        open(os.path.join(root, "rough", "._b0.png"), "wb").close()     # AppleDouble
+        os.makedirs(os.path.join(root, ".hidden"))
+        open(os.path.join(root, ".hidden", "b.png"), "wb").close()
+        st.brush_set = "rough"
+        check("hidden '._x.png' files are not brushes",
+              all(not os.path.basename(p).startswith(".") for p in B.files(st)[2])
+              and len(B.files(st)[2]) == 2, [os.path.basename(p) for p in B.files(st)[2]])
+        check("a hidden folder is not a brush set", ".hidden" not in B.sets(root),
+              str(B.sets(root)))
+        first = B.set_items(st, None)
+        B.refresh()                                  # rescans: new list objects inside
+        again = B.set_items(st, None)
+        check("the dropdown gets the SAME list (its strings stay alive) for the same sets",
+              again is first and again[0][1] is first[0][1])
+
+        arr = np.random.default_rng(0).random((2048, 2048, 4)).astype(np.float32)
+        small = B.downsample(arr, 1024)
+        check("a 2048 brush is downsampled to 1024 by exact 2x2 means",
+              small.shape == (1024, 1024, 4)
+              and np.allclose(small[3, 5], arr[6:8, 10:12].mean(axis=(0, 1))))
+        odd = B.downsample(np.ones((1500, 900, 4), np.float32), 1024)
+        check("non-integer factors keep the aspect, long side at the cap",
+              odd.shape[:2] == (1024, 614), odd.shape)
+        check("a brush already at or under the cap is untouched",
+              B.downsample(small, 1024) is small)
+
         # ---- what actually ships ------------------------------------------
         B.refresh()
         shipped = B.default_root()

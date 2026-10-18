@@ -342,11 +342,19 @@ class AUTOSTROKE_OT_build_material(bpy.types.Operator):
         name="Rebuild from scratch", default=False,
         description="Discard the existing node graph instead of re-pointing its images")
 
+    @classmethod
+    def poll(cls, context):
+        # the panel shows this button for a SELECTION, which can exist with no active
+        # object at all -- build() needs the active mesh
+        obj = context.active_object
+        return obj is not None and obj.type == 'MESH'
+
     def execute(self, context):
         try:
             msg = build(context.active_object, force_rebuild=self.force_rebuild)
-        except RuntimeError as e:
-            self.report({'ERROR'}, str(e))
+        except Exception as e:
+            self.report({'ERROR'}, str(e) if isinstance(e, RuntimeError)
+                        else "%s: %s" % (type(e).__name__, e))
             return {'CANCELLED'}
         self.report({'INFO'}, msg)
         return {'FINISHED'}

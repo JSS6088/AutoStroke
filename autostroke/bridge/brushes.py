@@ -11,6 +11,7 @@ another meant to. Scaling every brush to a common painted extent would silently 
 
 import os
 
+import numpy as np
 import bpy
 
 from . import images as bi
@@ -43,16 +44,27 @@ def root_dir(st):
     return default_root()
 
 
-def _scan(root):
-    """Subdirectory names holding at least one image, sorted."""
+def is_brush_file(name):
+    """An image by extension -- and not a hidden file. A pack zipped on a Mac carries
+    '._name.png' AppleDouble files beside every image: they end in .png but hold no
+    pixels, and load as 0x0 images."""
+    return not name.startswith(".") and name.lower().endswith(EXTS)
+
+
+def _listdir(d):
     try:
-        names = os.listdir(root)
+        return os.listdir(d)
     except OSError:
         return []
+
+
+def _scan(root):
+    """Subdirectory names holding at least one image, sorted."""
     out = []
-    for name in sorted(names):
+    for name in sorted(_listdir(root)):
         d = os.path.join(root, name)
-        if os.path.isdir(d) and any(f.lower().endswith(EXTS) for f in os.listdir(d)):
+        if (not name.startswith(".") and os.path.isdir(d)
+                and any(is_brush_file(f) for f in _listdir(d))):
             out.append(name)
     rank = {n: i for i, n in enumerate(PREFERRED_FIRST)}
     return sorted(out, key=lambda n: (rank.get(n, len(rank)), n))
@@ -86,14 +98,26 @@ def refresh():
     _files_cache.clear()
 
 
+_ITEMS_BY_SETS = {}
+"""Every item list ever returned, by the sets it lists, and never emptied. Blender keeps
+raw pointers to an items callback's strings and may call the callback again while still
+holding the previous result; rebuilding the list on every call freed those strings under
+it -- garbled labels, or a crash opening the dropdown. Returning the SAME list for the
+same folder contents keeps every string alive. Tiny: a few entries per brush folder."""
+
+
 def set_items(self, context):
     """EnumProperty items callback. `self` is the settings group, so it carries brush_dir."""
     global _SET_ITEMS
-    found = sets(root_dir(self))
-    _SET_ITEMS = [(n, n.replace("_", " ").title(), "%s brush set" % n) for n in found]
-    if not _SET_ITEMS:
-        _SET_ITEMS = [('NONE', "(no brush sets found)", "No subfolder here holds an image")]
-    return _SET_ITEMS
+    found = tuple(sets(root_dir(self)))
+    items = _ITEMS_BY_SETS.get(found)
+    if items is None:
+        items = [(n, n.replace("_", " ").title(), "%s brush set" % n) for n in found]
+        if not items:
+            items = [('NONE', "(no brush sets found)", "No subfolder here holds an image")]
+        _ITEMS_BY_SETS[found] = items
+    _SET_ITEMS = items
+    return items
 
 
 def files(st):
@@ -109,10 +133,7 @@ def files(st):
     # Cached for the same reason the set list is: the panel asks for this on every redraw
     # to show the brush count, and that would be a directory listing per redraw.
     if d not in _files_cache:
-        try:
-            found = sorted(f for f in os.listdir(d) if f.lower().endswith(EXTS))
-        except OSError:
-            found = []
+        found = sorted(f for f in _listdir(d) if is_brush_file(f))
         _files_cache[d] = [os.path.join(d, f) for f in found]
     return root, name, _files_cache[d]
 
@@ -120,9 +141,12 @@ def files(st):
 def load_masks(st, cfg):
     """The chosen set as a list of (H,W) float32 masks. Raises with an artist-facing message.
 
-    One datablock per brush, loaded with check_existing so re-baking does not pile up
-    copies, and scaled in place -- never images.remove(), which would null out every
-    reference to the datablock including any material node pointing at it.
+    The image is only READ, never changed: brushes used to be shrunk with img.scale(),
+    which marks the datablock modified -- and Blender's "Save Modified Images" (offered on
+    every save and quit) then wrote the shrunken brush back over the artist's file. Large
+    brushes are downsampled here in numpy instead. A datablock this call loaded just to
+    read is removed again; one that already existed (the artist's own, or left by an
+    older version) is kept, and reloaded from disk first if a past scale() left it dirty.
     """
     from ..core import baker
 
@@ -132,16 +156,47 @@ def load_masks(st, cfg):
             "No brush images in %s. A brush set is a subfolder of that directory holding "
             "one or more images (png, tga, tif, exr, jpg)."
             % (os.path.join(root, name) if name else root))
-    masks = []
+    masks, unreadable = [], []
     for path in paths:
-        img = bpy.data.images.load(path, check_existing=True)
-        # Non-Color: the mask is a shape, not a picture. Leaving it sRGB applies a
-        # transfer curve to the brush and silently changes coverage.
-        if img.colorspace_settings.name != 'Non-Color':
-            img.colorspace_settings.name = 'Non-Color'
-        if max(img.size) > BRUSH_MAX_PX:
-            w, h = img.size
-            k = BRUSH_MAX_PX / float(max(w, h))
-            img.scale(max(1, int(round(w * k))), max(1, int(round(h * k))))
-        masks.append(baker.mask_from_rgba(bi.image_to_numpy(img, img.channels), cfg))
+        n_before = len(bpy.data.images)
+        try:
+            img = bpy.data.images.load(path, check_existing=True)
+        except RuntimeError:
+            unreadable.append(os.path.basename(path))
+            continue
+        ours = len(bpy.data.images) > n_before
+        try:
+            if not ours and img.is_dirty:
+                img.reload()            # undo an older version's in-memory scale()
+            # Non-Color: the mask is a shape, not a picture. Leaving it sRGB applies a
+            # transfer curve to the brush and silently changes coverage.
+            if img.colorspace_settings.name != 'Non-Color':
+                img.colorspace_settings.name = 'Non-Color'
+            if min(img.size) < 1:       # corrupt or not really an image: 0 x 0
+                unreadable.append(os.path.basename(path))
+                continue
+            arr = downsample(bi.image_to_numpy(img, img.channels), BRUSH_MAX_PX)
+            masks.append(baker.mask_from_rgba(arr, cfg))
+        finally:
+            if ours:
+                bpy.data.images.remove(img)
+    if not masks:
+        raise RuntimeError("None of the images in %s could be read (%s)"
+                           % (os.path.join(root, name), ", ".join(unreadable[:5])))
     return masks, name
+
+
+def downsample(arr, max_px):
+    """(H, W, C) -> at most max_px on its long side, aspect kept. Exact block means for
+    whole-number factors (2048 -> 1024, the common case), nearest sampling otherwise."""
+    h, w = arr.shape[:2]
+    if max(h, w) <= max_px:
+        return arr
+    k = max(h, w) / float(max_px)
+    if k == int(k) and h % int(k) == 0 and w % int(k) == 0:
+        f = int(k)
+        return arr.reshape(h // f, f, w // f, f, -1).mean(axis=(1, 3)).astype(arr.dtype)
+    nh, nw = max(1, int(round(h / k))), max(1, int(round(w / k)))
+    yi = np.minimum(((np.arange(nh) + 0.5) * (h / float(nh))).astype(np.int64), h - 1)
+    xi = np.minimum(((np.arange(nw) + 0.5) * (w / float(nw))).astype(np.int64), w - 1)
+    return arr[yi][:, xi]

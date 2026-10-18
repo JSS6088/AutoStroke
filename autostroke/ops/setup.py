@@ -28,6 +28,12 @@ def validate(obj):
     if obj.type != 'MESH':
         return ["%s is not a mesh" % obj.name]
     problems = []
+    if getattr(obj, "library", None) is not None or getattr(obj.data, "library", None):
+        # The bake writes the mesh's UV-keyed maps, its material slots and a cache tag
+        # on the object; linked data is read-only, and each of those writes would fail
+        # half-way through a bake
+        problems.append("%s is linked from another file -- make it local to bake it "
+                        "(Object > Relations > Make Local)" % obj.name)
     if not obj.data.polygons:
         problems.append("%s has no faces" % obj.name)
     if not obj.data.uv_layers:

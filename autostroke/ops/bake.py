@@ -167,6 +167,16 @@ def targets(context):
     return []
 
 
+def _failure(e):
+    """An exception as one line for the bake report. Expected failures (RuntimeError,
+    MeshError) are already artist-facing sentences; anything else is a bug, so its
+    traceback goes to the console where it can be reported."""
+    if isinstance(e, (RuntimeError, mesh_bridge.MeshError)):
+        return str(e)
+    traceback.print_exc()
+    return "%s: %s" % (type(e).__name__, e)
+
+
 class Job:
     """One object's worth of bake state -- what used to be flat attributes on the
     operator itself, back when there was only ever one object to bake.
@@ -179,7 +189,12 @@ class Job:
     """
 
     def __init__(self, obj):
-        self.obj = obj
+        # By NAME and session uid, never the Object: the bake runs across many modal
+        # steps, between which the user can delete the object, undo or open another file,
+        # and a release build does not invalidate a stored reference when its ID is freed.
+        # resolve() looks it up again each time it is needed.
+        self.name = obj.name
+        self.uid = getattr(obj, "session_uid", None)
         self.t0 = None
         self.stem = None
         self.pos_note = None
@@ -199,6 +214,21 @@ class Job:
         self.secs = None           # set by _write(): this job's own elapsed time
         self.coverage = None       # set by _write(): percent of valid texels covered
 
+    def resolve(self):
+        """This job's object, looked up now; RuntimeError if it is gone or replaced."""
+        obj = bpy.data.objects.get(self.name)
+        if obj is None or getattr(obj, "session_uid", None) != self.uid:
+            raise RuntimeError("%s was deleted, renamed or undone during the bake"
+                               % self.name)
+        return obj
+
+    def release(self):
+        """Drop the per-texel arrays once they are written (or the job failed). Finished
+        jobs stay listed for the report, and a REGISTER operator outlives its run in
+        wm.operators: at 4K-8K these arrays are gigabytes per object."""
+        self.surf_nrm = self.seeds = self.seed_tan = self.curv = None
+        self.valid = self.uv_self = self.gen = self.result = None
+
 
 class AUTOSTROKE_OT_bake(bpy.types.Operator):
     bl_idname = "autostroke.bake"
@@ -207,10 +237,13 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     _timer = None
+    _running = False
+    """One bake at a time, class-wide: a second one would add its own timer and modal
+    handler, and whichever finished first would end the other's progress bar."""
 
     @classmethod
     def poll(cls, context):
-        return bool(targets(context))
+        return not AUTOSTROKE_OT_bake._running and bool(targets(context))
 
     # ---- setup ------------------------------------------------------------
     def invoke(self, context, event):
@@ -219,6 +252,19 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
         if not objs:
             self.report({'ERROR'}, "No valid mesh objects selected")
             return {'CANCELLED'}
+        if not hasattr(context.scene, "cycles"):
+            # scene.render.engine = 'CYCLES' would raise mid-job; say why up front
+            self.report({'ERROR'}, "AutoStroke bakes with Cycles: enable the Cycles add-on "
+                                   "(Preferences > Add-ons)")
+            return {'CANCELLED'}
+        if context.mode != 'OBJECT':
+            # Cycles' bake (and the selection it needs) only runs in Object Mode, and Edit
+            # Mode holds mesh edits the bake would not see
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except RuntimeError as e:
+                self.report({'ERROR'}, "Switch to Object Mode to bake (%s)" % e)
+                return {'CANCELLED'}
 
         self._batch_t0 = time.time()
         self.stages = Stages()
@@ -230,8 +276,10 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
             with self.stages("brushes"):
                 self.mask, self.brush_set = load_brush(st, Config())
             self.cfg = config_from_settings(st, self.mask)
-        except RuntimeError as e:
-            self.report({'ERROR'}, str(e))
+        except Exception as e:
+            if not isinstance(e, RuntimeError):
+                traceback.print_exc()
+            self.report({'ERROR'}, str(e) or type(e).__name__)
             return {'CANCELLED'}
         self.device, self.device_note = pick_device(
             getattr(st, "bake_device", 'GPU'), bpy.app.background)
@@ -239,17 +287,28 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
         self.jobs = [Job(o) for o in objs]
         self.i = 0
 
+        # Start the first object that CAN start before registering as modal. Once
+        # modal_handler_add() has run, invoke() must return RUNNING_MODAL: returning
+        # CANCELLED frees this operator while its handler stays in the window's list,
+        # and the status bar, which reads every modal handler's operator on each
+        # redraw, then crashes Blender on the freed one. That was the crash when the
+        # first object failed to start.
+        while self._start_job(context, self.jobs[self.i]) is False:
+            job = self.jobs[self.i]
+            self.failed.append((job.name, job.error))
+            job.release()
+            self.i += 1
+            if self.i == len(self.jobs):
+                self._report_batch(context)
+                return {'CANCELLED'}
+
         wm = context.window_manager
         wm.progress_begin(0.0, 1.0)
         self._timer = wm.event_timer_add(0.05, window=context.window)
         wm.modal_handler_add(self)
         self._progress = 0.0
-        if self._start_job(context, self.jobs[0]):
-            return {'RUNNING_MODAL'}
-        # The very first object failed before it could even start resolving --
-        # _advance() is the same recovery path modal() uses mid-batch, so this does
-        # not need its own separate handling.
-        return self._advance(context)
+        AUTOSTROKE_OT_bake._running = True
+        return {'RUNNING_MODAL'}
 
     def _start_job(self, context, job):
         """Position/normal map -> seeds -> direction field -> the resolve_uv generator,
@@ -257,13 +316,13 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
         to `job` instead of `self` so a batch can run it once per object.
 
         Returns True on success (job.gen is ready for modal() to advance) or False,
-        having recorded job.error, on a caught (RuntimeError, MeshError) -- a failure
-        here skips this one object rather than cancelling the whole operator.
+        having recorded job.error, on ANY exception -- a failure here skips this one
+        object rather than cancelling the whole operator.
         """
         st = context.scene.autostroke
-        obj = job.obj
         job.t0 = time.time()
         try:
+            obj = job.resolve()
             job.stem = safe_name(obj.name)
             res = int(st.resolution)
 
@@ -288,7 +347,8 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
                         bpy.data.images.load(npath, check_existing=True), 3)
                 job.pos_note = "position: cached"
             else:
-                context.window.cursor_set('WAIT')
+                if context.window:
+                    context.window.cursor_set('WAIT')
                 # Exactly one Cycles bake in flight at a time, always: pos_bridge.bake
                 # reuses a single shared material+image datablock per channel across
                 # every object, and is only safe because each call fully completes and
@@ -304,7 +364,8 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
                     job.surf_nrm, nimg = pos_bridge.bake(obj, res, channel="normal")
                     bi.save_image(nimg, npath)
                 obj[sig_key] = sig
-                context.window.cursor_set('DEFAULT')
+                if context.window:
+                    context.window.cursor_set('DEFAULT')
                 job.pos_note = "position: baked"
 
             # --- seeds and direction: cached across look changes -------------
@@ -402,9 +463,10 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
                 job.gen = cpu_gen()
             job.pos_note = "%s · %s" % (job.pos_note, self._device_label(job))
             return True
-        except (RuntimeError, mesh_bridge.MeshError) as e:
-            context.window.cursor_set('DEFAULT')
-            job.error = str(e)
+        except Exception as e:
+            if context.window:
+                context.window.cursor_set('DEFAULT')
+            job.error = _failure(e)
             return False
 
     def _device_label(self, job):
@@ -440,6 +502,23 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
 
     # ---- the chunked loop --------------------------------------------------
     def modal(self, context, event):
+        try:
+            return self._modal(context, event)
+        except Exception as e:
+            # Whatever escaped -- the resolver, a closed area, data the user changed -- is
+            # this object's failure, not a reason to leave the timer, progress bar and
+            # header behind: record it and move on to the next object.
+            if self.i < len(self.jobs):
+                job = self.jobs[self.i]
+                self.failed.append((job.name, _failure(e)))
+                job.release()
+            try:
+                return self._advance(context)
+            except Exception:
+                traceback.print_exc()
+                return self._finish(context)
+
+    def _modal(self, context, event):
         if event.type == 'ESC':
             return self._finish(context, cancelled=True)
         if event.type != 'TIMER':
@@ -456,15 +535,17 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
             try:
                 self._write(context, job)
                 self.done.append(job)
-            except RuntimeError as e:
-                self.failed.append((job.obj.name, str(e)))
+            except Exception as e:
+                self.failed.append((job.name, _failure(e)))
+            job.release()
             return self._advance(context)
         self.stages.add("resolve", time.time() - t0)
         frac = (self.i + self._progress) / len(self.jobs)
         context.window_manager.progress_update(frac)
-        context.area.header_text_set(
-            "AutoStroke  Object %d/%d: %s — %.0f%%   (Esc to cancel)"
-            % (self.i + 1, len(self.jobs), job.obj.name, 100 * self._progress))
+        if context.area:                  # None once the area is closed or maximised
+            context.area.header_text_set(
+                "AutoStroke  Object %d/%d: %s — %.0f%%   (Esc to cancel)"
+                % (self.i + 1, len(self.jobs), job.name, 100 * self._progress))
         return {'RUNNING_MODAL'}
 
     def _advance(self, context):
@@ -478,30 +559,49 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
             job = self.jobs[self.i]
             if self._start_job(context, job):
                 return {'RUNNING_MODAL'}
-            self.failed.append((job.obj.name, job.error))
+            self.failed.append((job.name, job.error))
+            job.release()
             self.i += 1
         return self._finish(context)
 
     # ---- teardown ----------------------------------------------------------
-    def _finish(self, context, cancelled=False):
+    def _cleanup(self, context):
+        """Everything invoke() set up, undone -- safe to call more than once."""
         wm = context.window_manager
-        wm.event_timer_remove(self._timer)
+        if self._timer is not None:
+            wm.event_timer_remove(self._timer)
+            self._timer = None
         wm.progress_end()
         if context.area:
             context.area.header_text_set(None)
+        if context.window:
+            context.window.cursor_set('DEFAULT')
+        for job in getattr(self, "jobs", ()):
+            job.release()
+        AUTOSTROKE_OT_bake._running = False
+
+    def cancel(self, context):
+        """Blender ends the modal itself -- File > Open, closing the window, disabling the
+        add-on. Without this the timer would keep firing for an operator that is gone."""
+        self._cleanup(context)
+
+    def _finish(self, context, cancelled=False):
+        self._cleanup(context)
         if cancelled:
-            self.report({'WARNING'}, "Bake cancelled")
-            return {'CANCELLED'}
-        self._report_batch(context)
-        if not self.done:
-            return {'CANCELLED'}
-        return {'FINISHED'}
+            self.report({'WARNING'}, "Bake cancelled after %d of %d object%s"
+                        % (len(self.done), len(self.jobs), "" if len(self.jobs) == 1 else "s"))
+        else:
+            self._report_batch(context)
+        # Objects already baked changed real data (maps, materials): FINISHED gives them
+        # their own undo step even when the rest was cancelled or failed.
+        return {'FINISHED'} if self.done else {'CANCELLED'}
 
     def _write(self, context, job):
         """Turn one finished job's resolve_uv output into two EXRs plus a material.
         Raises RuntimeError on failure -- the CALLER (modal()) decides whether that
         skips this one object or is fatal; this function itself never touches self.i
         or the job queue."""
+        obj = job.resolve()               # still there, and still the same object?
         uv_out, dbg_out, covered, lum_out = job.result
         H, W, cfg, valid = job.H, job.W, self.cfg, job.valid
 
@@ -533,7 +633,7 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
         # expect, and it follows the surface if the mesh is later moved in Edit Mode.
         # Cycles' bake margin covers the valid region; dilate past it as before.
         with self.stages("tangent space"):
-            tan, uv_name = pos_bridge.to_tangent_space(job.obj, nrm_obj)
+            tan, uv_name = pos_bridge.to_tangent_space(obj, nrm_obj)
             maps["stroke_normal"] = baker.dilate_fill(tan, vimg, cfg.dilate_px)
         # numpy -> image datablock (img.pixels again) -> EXR on disk
         with self.stages("write maps"):
@@ -562,10 +662,10 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
         try:
             from . import material as material_ops
             with self.stages("material"):
-                material_ops.build(job.obj)
-        except RuntimeError as e:
+                material_ops.build(obj)
+        except Exception as e:
             self.report({'WARNING'}, "Maps baked but material failed for %s: %s"
-                        % (job.obj.name, e))
+                        % (job.name, _failure(e)))
 
     def _report_batch(self, context):
         """Assemble st.last_report (still one '|'-joined string, so the panel's
@@ -598,7 +698,7 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
             ("%.0fs" % total_secs) if total_secs < 90 else ("%.1f min" % (total_secs / 60)))]
         for job in self.done:
             lines.append("%s: %.1f%% coverage · %s strokes · %.0fs"
-                         % (job.obj.name, job.coverage,
+                         % (job.name, job.coverage,
                             "{:,}".format(job.sstats["strokes"]), job.secs))
         for name, detail in self.failed:
             lines.append("failed: %s — %s" % (name, detail))
