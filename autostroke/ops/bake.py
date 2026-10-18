@@ -526,14 +526,23 @@ class AUTOSTROKE_OT_bake(bpy.types.Operator):
             maps = {
                 "stroke_indirection":
                     baker.dilate_fill(indir.reshape(H, W, 3), vimg, cfg.dilate_px),
-                "stroke_normal":
-                    baker.dilate_fill(dbg.reshape(H, W, 3), vimg, cfg.dilate_px),
             }
+            nrm_obj = baker.dilate_fill(dbg.reshape(H, W, 3), vimg, cfg.dilate_px)
+        # Strokes are placed and resolved in object space, so their normals come out in
+        # it. The map ships in tangent space: what game engines and texturing tools
+        # expect, and it follows the surface if the mesh is later moved in Edit Mode.
+        # Cycles' bake margin covers the valid region; dilate past it as before.
+        with self.stages("tangent space"):
+            tan, uv_name = pos_bridge.to_tangent_space(job.obj, nrm_obj)
+            maps["stroke_normal"] = baker.dilate_fill(tan, vimg, cfg.dilate_px)
         # numpy -> image datablock (img.pixels again) -> EXR on disk
         with self.stages("write maps"):
             for key, arr in maps.items():
-                bi.write_map(arr, "%s_%s" % (job.stem, key),
-                             os.path.join(self.workdir, "%s_%s.exr" % (job.stem, key)))
+                name = "%s_%s" % (job.stem, key)
+                img = bi.write_map(arr, name, os.path.join(self.workdir, name + ".exr"))
+                if key == "stroke_normal":
+                    img[pos_bridge.NORMAL_SPACE] = 'TANGENT'
+                    img[pos_bridge.NORMAL_UV] = uv_name
 
         n_val, n_cov = int(valid.sum()), int(covered.sum())
         job.secs = time.time() - job.t0

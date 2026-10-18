@@ -35,11 +35,14 @@ def preserved_bake_settings(scene):
     genuinely confusing to debug: the object IS selected and active, just not in the
     mode this setting demands.
     """
+    bk = scene.render.bake
     saved = {
         "engine": scene.render.engine,
-        "margin": scene.render.bake.margin,
-        "use_clear": scene.render.bake.use_clear,
-        "use_selected_to_active": scene.render.bake.use_selected_to_active,
+        "margin": bk.margin,
+        "use_clear": bk.use_clear,
+        "use_selected_to_active": bk.use_selected_to_active,
+        "normal_space": bk.normal_space,
+        "normal_swizzle": (bk.normal_r, bk.normal_g, bk.normal_b),
     }
     has_cycles = hasattr(scene, "cycles")
     if has_cycles:
@@ -53,6 +56,8 @@ def preserved_bake_settings(scene):
         scene.render.bake.margin = saved["margin"]
         scene.render.bake.use_clear = saved["use_clear"]
         scene.render.bake.use_selected_to_active = saved["use_selected_to_active"]
+        bk.normal_space = saved["normal_space"]
+        bk.normal_r, bk.normal_g, bk.normal_b = saved["normal_swizzle"]
         if has_cycles:
             scene.cycles.device = saved["device"]
             scene.cycles.samples = saved["samples"]
@@ -241,7 +246,6 @@ def bake(obj, res, margin=BAKE_MARGIN, channel="position"):
     surface normal, used so texels no stamp covered fall back to real shading instead of
     black.
     """
-    scene = bpy.context.scene
     if not obj.data.uv_layers.active:
         raise RuntimeError("%s has no active UV map" % obj.name)
 
@@ -250,7 +254,73 @@ def bake(obj, res, margin=BAKE_MARGIN, channel="position"):
     tex = _find(mat.node_tree.nodes, "ShaderNodeTexImage")
     tex.image = img
     mat.node_tree.nodes.active = tex
+    _run(obj, mat, margin, channel, 'EMIT')
+    return bi.image_to_numpy(img, 3), img
 
+
+TANGENT_SRC = "AUTOSTROKE_object_space_normal"
+
+NORMAL_SPACE = "autostroke_normal_space"
+"""On the stroke normal map's image: the space it was baked in, 'TANGENT' since 0.14.0.
+A map without it predates that and is OBJECT space; the material reads this to set its
+Normal Map node, so an old bake keeps rendering correctly until it is re-baked."""
+NORMAL_UV = "autostroke_normal_uv"
+"""On the stroke normal map's image: the UV map whose tangents it was encoded against."""
+
+
+def to_tangent_space(obj, nrm_obj, margin=BAKE_MARGIN):
+    """Re-express an encoded OBJECT-space normal map in TANGENT space, via Cycles.
+
+    `nrm_obj` is TOP-DOWN (H,W,3) holding n*0.5+0.5. Returns (tangent, uv_name): the map
+    in Blender's tangent-space encoding (OpenGL, +Y), TOP-DOWN, with Cycles' own margin
+    around each UV island, and the UV map it was encoded against.
+
+    Cycles does the conversion rather than numpy because the encoding has to invert
+    exactly what the Normal Map node decodes at render time: the MikkTSpace tangent and
+    bitangent sign of this UV map, interpolated the way the renderer interpolates them,
+    on the render mesh, n-gons and custom normals included. A Normal bake in tangent
+    space is that inverse by construction. The UV map is named explicitly on both sides
+    (the source lookup here, the Normal Map node in the material), because an Image node
+    left unconnected reads the RENDER-active UV map while baking uses the active one.
+    """
+    uv = obj.data.uv_layers.active
+    if uv is None:
+        raise RuntimeError("%s has no active UV map" % obj.name)
+    h, w = nrm_obj.shape[:2]
+    src = bi.numpy_to_image(nrm_obj, TANGENT_SRC)
+    out = ensure_image(w, "tangent_normal")
+
+    mat = bpy.data.materials.get(MAT_NAME % "tangent") or \
+        bpy.data.materials.new(MAT_NAME % "tangent")
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    uvn = nt.nodes.new("ShaderNodeUVMap")
+    uvn.uv_map = uv.name
+    read = nt.nodes.new("ShaderNodeTexImage")
+    # Closest: each texel reads back exactly the value written for it, unblurred
+    read.image, read.interpolation = src, 'Closest'
+    nmap = nt.nodes.new("ShaderNodeNormalMap")
+    nmap.space = 'OBJECT'
+    bsdf = nt.nodes.new("ShaderNodeBsdfDiffuse")
+    outn = nt.nodes.new("ShaderNodeOutputMaterial")
+    target = nt.nodes.new("ShaderNodeTexImage")
+    target.image = out
+    nt.links.new(uvn.outputs["UV"], read.inputs["Vector"])
+    nt.links.new(read.outputs["Color"], nmap.inputs["Color"])
+    nt.links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
+    nt.links.new(bsdf.outputs["BSDF"], outn.inputs["Surface"])
+    nt.nodes.active = target
+
+    _run(obj, mat, margin, "tangent-space normal", 'NORMAL', normal_space='TANGENT')
+    return bi.image_to_numpy(out, 3), uv.name
+
+
+def _run(obj, mat, margin, channel, bake_type, normal_space=None):
+    """One Cycles bake of `mat` on `obj` alone, with every setting it touches restored --
+    the normal space and swizzle included, which is why they are set in here, inside
+    preserved_bake_settings, and not by the caller."""
+    scene = bpy.context.scene
     # preserved_selection is outermost so it restores LAST, after selectable() has put
     # the object's own hide/lock state back.
     with preserved_selection(bpy.context.view_layer), preserved_bake_settings(scene), \
@@ -258,9 +328,13 @@ def bake(obj, res, margin=BAKE_MARGIN, channel="position"):
         scene.render.engine = 'CYCLES'
         if hasattr(scene, "cycles"):
             scene.cycles.device = 'CPU'
-            scene.cycles.samples = 1      # emit bake needs no sampling
+            scene.cycles.samples = 1      # emit and normal bakes need no sampling
         scene.render.bake.margin = margin
         scene.render.bake.use_clear = True
+        if normal_space is not None:
+            bk = scene.render.bake
+            bk.normal_space = normal_space
+            bk.normal_r, bk.normal_g, bk.normal_b = 'POS_X', 'POS_Y', 'POS_Z'  # OpenGL (+Y)
         bpy.ops.object.select_all(action='DESELECT')
         obj.select_set(True)
         bpy.context.view_layer.objects.active = obj
@@ -275,10 +349,8 @@ def bake(obj, res, margin=BAKE_MARGIN, channel="position"):
                 "from the active view layer, or linked from a library. Check the "
                 "Outliner." % obj.name)
         try:
-            bpy.ops.object.bake(type='EMIT')
+            bpy.ops.object.bake(type=bake_type)
         except RuntimeError as e:
             raise RuntimeError(
                 "AutoStroke's Cycles bake failed baking the %s map for %s: %s"
                 % (channel, obj.name, e)) from e
-
-    return bi.image_to_numpy(img, 3), img

@@ -155,7 +155,11 @@ def configure(bpy_mod, bake_should_fail=None):
     bpy_mod.context = types.SimpleNamespace(scene=types.SimpleNamespace(
         render=types.SimpleNamespace(engine='CYCLES',
                                      bake=types.SimpleNamespace(margin=16, use_clear=True,
-                                                                use_selected_to_active=True)),
+                                                                use_selected_to_active=True,
+                                                                normal_space='OBJECT',
+                                                                normal_r='POS_X',
+                                                                normal_g='POS_Y',
+                                                                normal_b='POS_Z')),
         cycles=types.SimpleNamespace(device='CPU', samples=1)),
         view_layer=_ViewLayer())
     bpy_mod.ops = _Ops()

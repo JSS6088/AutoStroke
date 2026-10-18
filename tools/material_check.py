@@ -64,6 +64,10 @@ def make_scene():
 
     for key in ("stroke_normal", "stroke_indirection"):
         bpy.data.images.new("Crate_%s" % key, 8, 8, float_buffer=True)
+    # what a bake since 0.14.0 records on the normal map
+    nrm = bpy.data.images["Crate_stroke_normal"]
+    nrm["autostroke_normal_space"] = 'TANGENT'
+    nrm["autostroke_normal_uv"] = "UVMap"
     return obj, wood, metal, emit, other
 
 
@@ -87,8 +91,9 @@ def main():
           and not any(n.get(M.TAG) for n in wood.node_tree.nodes))
     bs = principled(s[0])
     nlink = bs.inputs["Normal"].links[0].from_node if bs.inputs["Normal"].links else None
-    check("stroke normal map -> Normal Map (object space) -> the BSDF's Normal",
-          nlink is not None and nlink.bl_idname == "ShaderNodeNormalMap" and nlink.space == 'OBJECT'
+    check("stroke normal map -> Normal Map (tangent, its UV map) -> the BSDF's Normal",
+          nlink is not None and nlink.bl_idname == "ShaderNodeNormalMap"
+          and nlink.space == 'TANGENT' and nlink.uv_map == "UVMap"
           and nlink.inputs["Color"].links[0].from_node.get(M.TAG) == "stroke_normal")
     mul = bs.inputs["Base Color"].links[0].from_node if bs.inputs["Base Color"].links else None
     check("Base Color = the material's own albedo x the per-stroke tone",
@@ -105,6 +110,9 @@ def main():
     grey = bpy.data.materials.get("Crate_AutoStroke")
     check("Emission-only material falls back to the grey AutoStroke material",
           s[2] == grey and "Emit" in msg)
+    gmap = next(n for n in grey.node_tree.nodes if n.bl_idname == "ShaderNodeNormalMap")
+    check("...whose Normal Map reads the map in tangent space too",
+          gmap.space == 'TANGENT' and gmap.uv_map == "UVMap")
     check("empty slot gets the grey material too", s[3] == grey)
 
     print("\nRE-BUILD (EVERY RE-BAKE DOES THIS)")
@@ -149,6 +157,28 @@ def main():
     check("Remove Strokes after a save + reopen still finds the originals",
           [s.material.name if s.material else None for s in obj.material_slots]
           == ["Wood", "Metal", "Emit", None])
+
+    print("\nMAPS BAKED BEFORE 0.14.0 (object space, nothing recorded on the image)")
+    old = bpy.data.objects.new("OldBake", bpy.data.meshes.new("OldBakeMesh"))
+    bpy.context.scene.collection.objects.link(old)
+    old.data.uv_layers.new(name="UVMap")
+    old_wood = bpy.data.materials.new("OldWood"); old_wood.use_nodes = True
+    old.data.materials.append(old_wood)
+    for key in ("stroke_normal", "stroke_indirection"):
+        bpy.data.images.new("OldBake_%s" % key, 8, 8, float_buffer=True)
+    M.build(old)
+    spaces = lambda m: [n.space for n in m.node_tree.nodes if n.bl_idname == "ShaderNodeNormalMap"]
+    ocopy, ogrey = old.material_slots[0].material, bpy.data.materials["OldBake_AutoStroke"]
+    check("an unrecorded map is still read in object space",
+          spaces(ocopy) == ['OBJECT'] and spaces(ogrey) == ['OBJECT'],
+          "%s / %s" % (spaces(ocopy), spaces(ogrey)))
+    oimg = bpy.data.images["OldBake_stroke_normal"]
+    oimg["autostroke_normal_space"] = 'TANGENT'
+    oimg["autostroke_normal_uv"] = "UVMap"
+    M.build(old)                                  # what re-baking it now does
+    check("re-baked, the same materials switch to tangent space, in place",
+          old.material_slots[0].material is ocopy and spaces(ocopy) == ['TANGENT']
+          and spaces(ogrey) == ['TANGENT'], "%s / %s" % (spaces(ocopy), spaces(ogrey)))
 
     print("\nOLDER FILES (one grey AutoStroke material in slot 0, nothing recorded)")
     legacy = bpy.data.objects.new("Legacy", bpy.data.meshes.new("LegacyMesh"))

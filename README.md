@@ -22,9 +22,11 @@ Blender 5.0+ · GPL-3.0-or-later
   a flattened UV layout paints every seam into the result. AutoStroke places strokes in 3D,
   sized to the faces they sit on and turned to run along the direction the surface bends
   least, eliminating presence of UV seams.
-- **Bakes two maps.** A **stroke normal map** lights like painted relief. An
-  **indirection map** records which stroke owns each texel, so any texture read through
-  it paints one flat colour per stroke.
+- **Bakes two maps.** A **stroke normal map** lights like painted relief. It's a standard
+  tangent-space map (MikkTSpace, OpenGL +Y), so it also works outside Blender; flip green
+  for engines that expect DirectX (−Y), such as Unreal. An **indirection map** records
+  which stroke owns each texel, so any texture read through it paints one flat colour per
+  stroke.
 - **Builds the material for you**, and the live preview shows the same result the bake
   writes.
 
@@ -45,7 +47,7 @@ Blender 5.0+ · GPL-3.0-or-later
 
 ## Install
 
-1. Download [`autostroke-0.13.4.zip`](autostroke-0.13.4.zip).
+1. Download [`autostroke-0.14.0.zip`](autostroke-0.14.0.zip).
 2. In Blender 5.0 or later: **Edit → Preferences → Get Extensions**, then the **▾** menu
    at the top right → **Install from Disk…**, and pick the zip.
 
@@ -88,8 +90,8 @@ Blender 5.0+ · GPL-3.0-or-later
      jumps to a stacked layer, a floating part or the far side of a fold
      ([§2.10](ALGORITHM.md#210-reachable-surface)).
 3. **Output.**
-   - The winner's normal goes into the stroke normal map, and its UV pointer and tone into
-     the indirection map.
+   - The winner's normal goes into the stroke normal map, converted to tangent space by a
+     Cycles normal bake, and its UV pointer and tone into the indirection map.
    - Gaps are dilated. Every material on the object gets a copy with the stroke normal
      and per-stroke tone wired in; its own colour and roughness are kept.
 

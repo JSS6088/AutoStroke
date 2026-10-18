@@ -118,8 +118,9 @@ def without_strokes(mat, grey):
         for link in list(n.outputs["Color"].links):
             nm = link.to_node
             nt.links.remove(link)
-            # an object-space Normal Map with nothing plugged in outputs a fixed normal,
-            # which would be wrong everywhere: take it out of the shader entirely
+            # a Normal Map with nothing plugged in outputs a fixed normal in object
+            # space (wrong everywhere) and the plain surface in tangent space: either
+            # way it has no business in the shader, so take it out entirely
             if nm.bl_idname == "ShaderNodeNormalMap":
                 for out in list(nm.outputs["Normal"].links):
                     nt.links.remove(out)
@@ -152,8 +153,8 @@ def painterly_colour(src_mat, nrm_img, ind_img, albedo_img):
 
     Base Color = the model's own albedo image read at the indirection map's (R, G) -- one
     flat colour per stroke -- times the stroke tone (B), remapped the way ops/material.py
-    does. Normal = the stroke normal map, object space. Roughness and metallic copy the
-    source material's plain values where it has them."""
+    does. Normal = the stroke normal map, in the space it was baked in. Roughness and
+    metallic copy the source material's plain values where it has them."""
     mat = bpy.data.materials.new("showcase_colour_%s" % (src_mat.name if src_mat else "grey"))
     mat.use_nodes = True
     nt = mat.node_tree
@@ -186,7 +187,10 @@ def painterly_colour(src_mat, nrm_img, ind_img, albedo_img):
     nrm = nt.nodes.new("ShaderNodeTexImage")
     nrm.image, nrm.interpolation = nrm_img, 'Linear'
     nmap = nt.nodes.new("ShaderNodeNormalMap")
-    nmap.space = 'OBJECT'
+    # TANGENT since 0.14.0, recorded on the image; a map without the record is older
+    nmap.space = nrm_img.get("autostroke_normal_space", 'OBJECT')
+    if nmap.space == 'TANGENT':
+        nmap.uv_map = nrm_img.get("autostroke_normal_uv", "")
     nt.links.new(nrm.outputs["Color"], nmap.inputs["Color"])
     nt.links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
 

@@ -3,15 +3,20 @@
 Deliberately NOT the same material as the position bake -- they are opposites. The bake
 material is a transient position emitter; this one samples THROUGH the indirection map.
 
-The normal channel needs no indirection lookup at all: <stem>_debug_normal is already
-flat-per-cell OBJECT-space normals, so it feeds a Normal Map node set to OBJECT and the
-painterly shading appears with no artist-supplied art. Indirection sampling earns its
-keep for the channels the artist does supply.
+The normal channel needs no indirection lookup at all: <stem>_stroke_normal already holds
+each stroke's normal, so it feeds a Normal Map node and the painterly shading appears with
+no artist-supplied art. Indirection sampling earns its keep for the channels the artist
+does supply.
+
+The map is TANGENT space since 0.14.0 and OBJECT space before; its image records which
+(bridge/position.py NORMAL_SPACE), and every Normal Map node reading it is set from that
+record, so a file baked by an older version still renders right until it is re-baked.
 """
 
 import bpy
 
 from .bake import safe_name
+from ..bridge.position import NORMAL_SPACE, NORMAL_UV
 
 MAT_SUFFIX = "_AutoStroke"
 
@@ -70,6 +75,22 @@ def _configure(node, img, key):
     img.colorspace_settings.name = 'Non-Color'
 
 
+def _decode_as(nmap, img):
+    """Set a Normal Map node to read `img` in the space it was baked in."""
+    space = img.get(NORMAL_SPACE, 'OBJECT') if img is not None else 'OBJECT'
+    nmap.space = space
+    # the UV map the tangents came from, named outright: left empty, the node would use
+    # the RENDER-active UV map, which need not be the active one the bake used
+    nmap.uv_map = img.get(NORMAL_UV, "") if space == 'TANGENT' else ""
+
+
+def _decode_all(nt, tex, img):
+    """Every Normal Map node fed by `tex`, set to read `img` in its own space."""
+    for link in tex.outputs["Color"].links:
+        if link.to_node.bl_idname == "ShaderNodeNormalMap":
+            _decode_as(link.to_node, img)
+
+
 def _build_fresh(mat, nrm_img, ind_img):
     nt = mat.node_tree
     nt.nodes.clear()
@@ -80,7 +101,7 @@ def _build_fresh(mat, nrm_img, ind_img):
     tex = nt.nodes.new("ShaderNodeTexImage"); tex.location = (-300, -100)
     _configure(tex, nrm_img, "stroke_normal")
     nmap = nt.nodes.new("ShaderNodeNormalMap")
-    nmap.space = 'OBJECT'             # the baked normals ARE object-space
+    _decode_as(nmap, nrm_img)
     nmap.location = (0, -100)
     nt.links.new(tex.outputs["Color"], nmap.inputs["Color"])
     nt.links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
@@ -140,7 +161,7 @@ def _principled(nt):
 def wire_strokes(mat, nrm_img, ind_img):
     """Add the stroke maps to an artist's material, keeping everything else it does.
 
-    Normal: the stroke normal map (object space) into the Principled BSDF's Normal input.
+    Normal: the stroke normal map into the Principled BSDF's Normal input.
     That replaces whatever fed Normal before -- one input, one normal. Base Color: the
     material's own base colour (a linked node or its plain value) times the per-stroke
     tone, the same 0.85..1.0 remap the grey material uses. Every node added is tagged, so
@@ -159,7 +180,7 @@ def wire_strokes(mat, nrm_img, ind_img):
     _configure(tex, nrm_img, "stroke_normal")
     nmap = _node(nt, "stroke_normal_map", "ShaderNodeNormalMap") or \
         _new(nt, "stroke_normal_map", "ShaderNodeNormalMap", (x - 350, y - 450))
-    nmap.space = 'OBJECT'             # the baked normals ARE object-space
+    _decode_as(nmap, nrm_img)
     nt.links.new(tex.outputs["Color"], nmap.inputs["Color"])
     nt.links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
 
@@ -304,6 +325,10 @@ def _grey(obj, nrm_img, ind_img, force_rebuild):
             node = _tagged(mat.node_tree, key)
             if node is not None:
                 _configure(node, img, key)
+                if key == "stroke_normal":
+                    # a re-bake can change the map's space (an OBJECT-space map from an
+                    # older version, re-baked as TANGENT): the decoder must follow it
+                    _decode_all(mat.node_tree, node, img)
     return mat
 
 

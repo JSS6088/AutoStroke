@@ -392,8 +392,11 @@ def per_job_timing(bake_mod):
     import autostroke.bridge.images as bi
     import autostroke.ops.material as material_ops
     orig_write_map, orig_build = bi.write_map, material_ops.build
-    bi.write_map = lambda arr, name, path: None
+    orig_tangent = bake_mod.pos_bridge.to_tangent_space
+    bi.write_map = lambda arr, name, path: {}      # _write tags the normal map's image
     material_ops.build = lambda obj, **kw: None
+    # the tangent-space conversion is a Cycles bake: pass the map through unchanged
+    bake_mod.pos_bridge.to_tangent_space = lambda obj, arr: (arr, "UVMap")
     try:
         H = W = 4
         valid = np.ones(H * W, bool)
@@ -442,6 +445,7 @@ def per_job_timing(bake_mod):
     finally:
         bi.write_map = orig_write_map
         material_ops.build = orig_build
+        bake_mod.pos_bridge.to_tangent_space = orig_tangent
 
 
 def report_batch_tests(bake_mod):
